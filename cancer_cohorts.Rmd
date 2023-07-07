@@ -1,0 +1,580 @@
+---
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Cancer cohort building and survival analysis in R
+
+This notebook will walk you through building cancer cohorts using the LabKey
+API in R. You are welcome to copy/paste any code from this notebook for
+your own scripts/notebooks.
+
+## Contents:
+
+* Import R libraries you need
+* Helper function to access the LabKey API with R
+* Cancer recruited disease
+  * Recruited disease
+  * Confirming the diagnosis
+* Cancer characteristics
+  * Staging
+  * Hormone status
+  * Metastases
+* Cancer treatment
+  * Chemotherapy and immunotherapy
+  * Radiotherapy
+  * Surgery
+* Demographics
+  * Deprivation and ethnicity
+  * Risk factors
+* Age
+* Survival analysis
+* Filepaths
+
+## Import R libraries you need
+
+```{r}
+library(tidyverse)
+library(Rlabkey)
+```
+
+## Helper function to access the LabKey API with R
+
+The following R function accesses the LabKey API, executes an SQL query
+to the specified database and returns it as a dataframe. We recommend
+putting this at the beginning of your scripts/notebooks and invoking it
+every time you want to access the database.
+
+```{r}
+labkey_to_df <- function(sql_query, database, maxrows = 100000000){
+    # Retrieve LabKey table based on a user SQL query.
+    # 
+    # Arguments:
+    #       sql_query =   SQL query to ask the data base (character vector
+    #                     of size 1).
+    #       database  =   path containing the version of the programme
+    #                     release to investigate (e.g.: "/main-programme/
+    #                     main-programme_v14_2022-01-27")
+    #       maxrows   =   number of rows to ask from the database. This 
+    #                     parameter defaults to 100000000, but if the
+    #                     output contains exactly the default value, then
+    #                     we suggest increasing this value.
+    
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+```
+
+To run my queries, I'll need to set up my database version:
+
+```{r}
+version <- "main-programme/main-programme_v17_2023-03-30"
+```
+
+##  Cancer recruited disease
+
+### Recruited disease
+
+Here we define an SQL query that will get all the participants with Breast Cancer.
+
+```{r}
+type <- "BREAST"
+cancer_type <- paste("SELECT   participant_id, disease_type, study_abbreviation ",
+ "FROM cancer_analysis ",
+ "WHERE disease_type='", type, "'", sep="")
+```
+
+Now I can use my SQL query with my version and the helper function to
+retrieve the data and convert it to a dataframe. Lastly, I can print the dataframe.
+
+```{r}
+cancer_query <- labkey_to_df(cancer_type, version, 100000)
+cancer_query
+```
+
+### Confirming the diagnosis
+
+Due to flaws in how the data was originally curated into the
+`cancer_analysis` table, we recommend verifying this diagnosis by checking
+the hospital episode statistics tables for the correct ICD-10 codes.
+
+There are three tables of hospital episode statistics with ICD-10 in the
+GEL data:
+
+- hes_apc
+- hes_op
+- hes_ae
+
+(There is also the hes_cc table, but this does not include diagnoses.)
+
+While some are more likely to capture cancer diagnosis than others for
+completeness it is good practice to check all three.
+
+We're checking with the ICD-10 code C50, which is breast cancer. You can
+look up codes on the [WHO ICD
+website]([<https://icd.who.int/browse10/2016/en>)](https://icd.who.int/browse10/2016/en)).
+
+```{r}
+participant <- toString(cancer_query$participant_id)
+
+hes_tables <- c("apc", "op", "ae")
+icd_code <- "C50"
+
+concatenated <- c()
+
+for (hes_table in hes_tables) {
+  sqlstr <- paste("SELECT participant_id ",
+                  "FROM hes_", hes_table,
+                  " WHERE participant_id IN (", participant, ")",
+                  " AND diag_all LIKE '%", icd_code, "%'",
+                  sep = "")
+  
+  filtered_participants <- labkey_to_df(sqlstr, version, 100000)
+  if (nrow(filtered_participants) > 0) {
+    concatenated <- append(concatenated, filtered_participants$participant_id) }
+}
+BC_participants <- unique(concatenated)
+```
+
+Now we have a list of participants that have confirmed breast cancer in
+HES, we can filter our initial dataset:
+
+```{r}
+ca_confirmed <- filter(cancer_query, participant_id %in% BC_participants)
+ca_confirmed
+```
+
+## Cancer characteristics
+
+The data from the National Cancer Registration and Analysis Service (NCRAS) contains information on hormonal status, stage and diagnosis dates.
+
+some notes about accessing this data:
+- Some participants have multiple tumour samples sequenced. It is good practice to match `diagnosis_date` from `cancer_staging_consolidated` with `tumour_clinicial_sample_time` from `cancer_analysis` when merging data.
+
+### Staging
+
+Let's assess the Grade and AJCC and TNM stages of our breast cancer participants:
+
+```{r}
+bc_participant <- paste(BC_participants, collapse = ", ")
+
+staging_sql <- paste("SELECT
+        ca.participant_id,
+        ca.tumour_sample_platekey,
+        ca.disease_type,
+        ca.tumour_clinical_sample_time,
+        csc.diagnosis_date,
+        csc.grade,
+        csc.component_tnm_t,
+        csc.component_tnm_n,
+        csc.component_tnm_m,
+        csc.ajcc_stage
+    FROM cancer_analysis ca
+    INNER JOIN cancer_staging_consolidated csc
+    ON ca.participant_id = csc.participant_id
+    AND csc.diagnosis_date =
+                (
+                SELECT 
+                    MAX(csc_e.diagnosis_date)
+                FROM 
+                    cancer_staging_consolidated csc_e 
+                WHERE 
+                    csc_e.participant_id = csc.participant_id 
+                    AND 
+                    ca.tumour_clinical_sample_time >= csc_e.diagnosis_date
+                )
+    WHERE ca.participant_id IN (", bc_participant, ")",
+    sep="")
+
+staging_query <- labkey_to_df(staging_sql, version, 100000)
+staging_query
+```
+
+This query works because the list of participant IDs is quite short, however there is a limit on the size of an SQL string. If you have a larger number of IDs, this query may fail; we recommend fetching the whole table without filtering then subsetting the table afterwards.
+
+### Hormone status
+
+Let's assess oestrogen receptor (ER), progesterone receptor (PR), and HER2 status of our breast cancer samples:
+
+```{r}
+
+hormone_sql <- paste("SELECT
+        ca.participant_id,
+        ca.tumour_sample_platekey,
+        ca.disease_type,
+        av.anon_tumour_id,
+        av.er_status,
+        av.pr_status,
+        av.her2_status
+    FROM cancer_analysis ca
+    INNER JOIN av_tumour av
+    ON ca.participant_id = av.participant_id
+    WHERE ca.participant_id IN (", bc_participant, ")", 
+    sep= "")
+
+
+hormone_query <- labkey_to_df(hormone_sql, version, 100000)
+hormone_query
+```
+
+We can join these two tables together to create a larger dataframe:
+
+```{r}
+stages_and_hormones = merge(staging_query, hormone_query)
+stages_and_hormones
+```
+
+### Metastases
+
+We will now query the `cancer_participant_tumour_metastatic_site` table to find participants in our cohort whose tumours have metastasised.
+
+```{r}
+metastases_sql <- paste("SELECT participant_id, metastatic_site
+    FROM cancer_participant_tumour_metastatic_site
+    WHERE participant_id IN (", bc_participant, ")", sep = "")
+
+metastases_query <- labkey_to_df(metastases_sql, version, 100000)
+metastases_query
+```
+This is unlikely to find all the participants whose tumours have metastasised as the `cancer_participant_tumour_metastatic_site` table is not complete. You can supplement this query by looking for ICD-10 codes for metastases in the hospital episode statistics tables, or looking at the `cancer_registry` table. Extra care is needed to differentiate between metastasis, new primary tumours or recurrence of the primary tumour.
+
+The query below searches the `hes_*` tables for ICD-10 codes associated with metastasis: C76-C80. It then concatenates these into a single table.
+
+```{r}
+meta_codes <- c('C76', 'C77', 'C78', 'C79', 'C80')
+hes_tables <- c("apc", "op", "ae")
+
+meta_concat <- data.frame()
+
+diag_statement <- paste(meta_codes, collapse = "%' OR diag_all LIKE '%")
+
+for (hes_table in hes_tables) {
+  sqlstr <- paste("SELECT participant_id, diag_all ",
+      "FROM hes_", hes_table,
+      " WHERE participant_id IN (", bc_participant, ")",
+      " AND diag_all LIKE '%", diag_statement, "%'",
+      sep = "")
+    meta_hes <- labkey_to_df(sqlstr, version, 1000000)
+    if (nrow(meta_hes) > 0) {
+    meta_concat <- rbind(meta_concat, meta_hes)
+    }
+}
+
+meta_concat
+```
+
+Similarly, we can search the `cancer_site` column of `cancer_registry` for the same ICD-10 codes.
+
+```{r}
+site_statement <- paste(meta_codes, collapse = "%' OR cancer_site LIKE '%")
+
+reg_sql <- paste("SELECT participant_id, cancer_site ",
+      "FROM cancer_registry 
+      WHERE participant_id IN (", bc_participant, ")",
+      " AND cancer_site LIKE '%", site_statement, "%'",
+      sep = "")
+
+reg_query <- labkey_to_df(reg_sql, version, 100000)
+reg_query
+```
+
+
+## Cancer treatment
+
+### Chemotherapy and immunotherapy
+
+Public Health England's (PHE) systemic anti-cancer therapy (`sact`) contains clinical management on patients receiving cancer chemotherapy, and newer agents that have anti-cancer effects, in or funded by the NHS in England.
+
+- `sact` is in a long format, with participants occuring in multiple rows, each capturing one regimen of treatment.
+- Therapies can be captured in both the `drug_group` and `analysis_group` as part of multi-drug regimens.
+
+The following function checks SACT table for the drug specified.
+
+```{r}
+
+sact_drug_finder <- function(drug.names, treat.df){
+  # checks SACT table for presence of particular drugs in both the
+  # drug_group as well as the analysis_group columns
+  
+  # Args:
+  #   drug.names  = character vector of drug names (str)
+  #   treat.df    = Data frame containing a treatment table
+  
+  # Returns:
+  #   Data frame of treatment table with rows containing the drug of interest.
+  
+  require(tidyverse)
+  
+  all.drugs <- drug.names %>%
+    toupper() %>%
+    unique() %>%
+    paste(collapse = "|")
+  
+  # Treatment tables use redundant terminology
+  drug.cols <- c("analysis_group", "drug_group", "regimenname", "drugname", "eventdesc")
+  ## Identify columns of the current table
+  table.drug.cols <- intersect(colnames(treat.df), drug.cols)
+  
+  treat.df %>%
+    pivot_longer(all_of(table.drug.cols),
+                 names_to = "drug_source", values_to = "drug") %>%
+    filter(!is.na(drug)) %>%
+    filter(str_detect(drug, all.drugs)) %>%
+    distinct() %>%
+    pivot_wider(names_from = "drug_source", values_from = "drug")
+}
+```
+
+Lets capture Trastuzumab (Herceptin) treatment:
+
+```{r}
+# grab sact entries for tumours in our data:
+tumour_ids <- toString(stages_and_hormones$anon_tumour_id)
+
+sact_sql <- paste(
+    "SELECT
+        participant_id,
+        anon_tumour_id,
+        analysis_group,
+        primary_diagnosis,
+        drug_group,
+        cycle_number,
+        programme_number,
+        start_date_of_cycle,
+        administration_date
+    FROM
+        lists.sact
+    WHERE
+        anon_tumour_id IN (", tumour_ids, ")", sep="")
+
+sact_query <- labkey_to_df(sact_sql, version, 100000)
+sact_trastuzumab <- sact_drug_finder(list('Trastuzumab'), sact_query)
+sact_trastuzumab
+```
+
+`sact_trastuzumab` now contains all treatment cycles of tumours treated with
+Trastuzumab in our breast cancer cohort.
+
+### Radiotherapy
+
+We're now going to find particpants who had anti-cancer radiotherapy on their primary tumour. To do this we're filtering the `rtds` table by `radiotherapyintent` `1`,and `rttreatmentregion` `P`.
+
+```{r}
+intent <- "1"
+region <- "P"
+
+part_ids <- toString(stages_and_hormones$participant_id)
+
+rtds_sql <- paste(
+    "SELECT
+        participant_id,
+        apptdate,
+        radiotherapyintent,
+        rttreatmentregion,
+        rtactualdose,
+        radiotherapybeamtype,
+        radiotherapybeamenergy
+    FROM rtds
+    WHERE participant_id IN (", part_ids,
+        ") AND radiotherapyintent = ", intent,
+        "AND rttreatmentregion = '", region, "'",
+    sep="")
+
+rtds_query <- labkey_to_df(rtds_sql, version, 100000)
+rtds_query
+```
+
+### Surgery
+
+This query will identify all participants from our breast cancer list who have had curative surgery.
+
+```{r}
+treatment <- "Surgery - curative"
+
+surgery_sql <- paste("SELECT 
+        participant_id,
+        eventdesc,
+        opcs4_code,
+        opcs4_name
+    FROM av_treatment
+    WHERE participant_id IN (", part_ids, ")
+        AND eventdesc = '", treatment, "'",       
+    sep = "")
+
+surgery_query <- labkey_to_df(surgery_sql, version, 100000)
+surgery_query
+```
+
+##  Demographics
+
+We're now going to fetch some general details about the participants that you might use to filter participants by demographics, looking at deprivation, ethnicity and risk factors.
+
+### Deprivation and ethnicity
+
+In the following query, we will fetch deprivation index data for our breast cancer list. We will also get ethnicity, both self-declared ethnicity (`participant_ethnic_category`) and genetically inferred ethnicity (`genetically_inferred_ancestry_thr`). The former is useful, along with the deprivation index, to look at societal effects on cancer. The latter is useful for looking at links between cancer and genetic ancestry.
+
+
+```{r}
+demographics_sql <-paste("SELECT p.participant_id, p.participant_ethnic_category,
+    ps.genetically_inferred_ancestry_thr, imd.imd
+    FROM participant as p, participant_summary as ps, av_imd as imd
+    WHERE p.participant_id = ps.participant_id
+    AND p.participant_id = imd.participant_id
+    AND p.participant_id IN (", part_ids, ")",
+    sep="")
+
+demographics_query <- labkey_to_df(demographics_sql, version, 10000)
+demographics_query
+```
+
+### Risk factors
+
+General risk factors, including height, weight, alcohol consumption and smoking, are in the `cancer_risk_factor_general` table, whereas risk factors specific to certain cancers are in `cancer_risk_factor_cancer_specific`, segrated into `cancer_type`. In the query below we will pull out participants from our breast cancer list who currently smoke.
+
+```{r}
+smoking <- "Current smoker"
+
+smoking_sql <- paste(
+    "SELECT participant_id
+    FROM cancer_risk_factor_general
+    WHERE participant_id IN (", part_ids, ")
+    AND smoking_status ='", smoking, "'",
+    sep = "")
+
+smoking_query <- labkey_to_df(smoking_sql, version, 10000)
+smoking_query
+```
+
+In the next query we will pull out a number of breast cancer risk factors for our list.
+
+```{r}
+bc_risk_sql <- paste(
+    "SELECT participant_id, age_of_menarche, age_of_menopause, number_of_pregnancies
+    FROM cancer_risk_factor_cancer_specific
+    WHERE participant_id IN (", part_ids, ")",
+    sep = "")
+
+bc_risk_query <- labkey_to_df(bc_risk_sql, version, 10000)
+bc_risk_query
+```
+
+## Age
+
+We don’t have Age stored. You need to calculate it from `yob` (`participant_summary` table). Age will always be an approximation, since we only have year and not full date: this is particularly important for anything in small children.
+
+We're going to find different ages for our list of breast cancer participants, starting with current age:
+
+```{r}
+current_age_sql <- paste("SELECT participant_id, 
+    (YEAR(CURDATE()) - yob) as current_age
+    FROM participant_summary
+    WHERE participant_id IN (", part_ids, ")",
+    sep="")
+
+current_age_query <- labkey_to_df(current_age_sql, version, 10000)
+current_age_query
+```
+
+To get the date when the sample was taken, you need to get the year from
+clinic_sample.
+
+```{r}
+sample_age_sql <- paste("SELECT ps.participant_id, cs.clinic_sample_id,
+    (YEAR (cs.clinic_sample_datetime) - ps.yob) as sample_age
+    FROM participant_summary as ps
+    JOIN clinic_sample as cs
+    ON ps.participant_id = cs.participant_id
+    WHERE ps.participant_id IN (", part_ids, ")",
+    sep="")
+
+sample_age_query <- labkey_to_df(sample_age_sql, version, 10000)
+sample_age_query
+```
+
+You can get age at diagnosis from the hes tables and cancer tables. This can sometimes be tricky as some records can be incomplete. In this example, we're going to find a diagnosis date from the `cancer_participant_tumour`, `av_tumour` and `cancer_register` tables by finding the oldest record with the diagnosis code we're interested in out of all those tables.
+
+```{r}
+cpt_sql <- paste("SELECT DISTINCT participant_id, 
+        YEAR(diagnosis_date) as diagnosis_date, 
+        diagnosis_icd_code as icd10_code
+    FROM cancer_participant_tumour
+    WHERE participant_id IN (", part_ids, ")
+    AND diagnosis_icd_code like '%", icd_code, "%'",
+    sep="")
+cpt_query = labkey_to_df(cpt_sql, version, 100000)
+
+av_sql <- paste("SELECT DISTINCT participant_id, 
+        YEAR(diagnosisdatebest) as diagnosis_date, 
+        site_icd10_o2 as icd10_code
+    FROM av_tumour
+    WHERE participant_id IN (", part_ids, ")
+    AND site_icd10_o2 like '%", icd_code, "%'",
+    sep="")
+av_query = labkey_to_df(cpt_sql, version, 100000)
+
+cr_sql <- paste("SELECT DISTINCT participant_id, 
+        YEAR(event_date) as diagnosis_date, 
+        cancer_site as icd10_code
+    FROM cancer_registry
+    WHERE participant_id IN (", part_ids, ")
+    AND cancer_site like '%", icd_code, "%'",
+    sep="")
+cr_query = labkey_to_df(cpt_sql, version, 100000)
+
+diagnosis_concat <- rbind(cpt_query, av_query, cr_query)
+aggregate(diagnosis_concat$diagnosis_date, by = list(diagnosis_concat$participant_id, diagnosis_concat$icd10_code), min)
+
+yob_sql <- paste("SELECT participant_id, yob
+    FROM participant_summary
+    WHERE participant_id IN (", part_ids, ")", sep = "")
+yob_query <- labkey_to_df(yob_sql, version, 100000)
+
+diag_age_table <- merge(yob_query, diagnosis_concat)
+diag_age_table$diag_age <- as.numeric(diag_age_table$diagnosis_date) - as.numeric(diag_age_table$yob)
+diag_age_table
+```
+
+Age at death can be easily calculated from the `participant_summary` table:
+
+```{r}
+death_sql <- paste("SELECT participant_id, yob, death_date, 
+    (YEAR (death_date) - yob) as death_age
+    FROM participant_summary
+    WHERE participant_id IN (", part_ids, ")", sep = "")
+death_query <- labkey_to_df(death_sql, version, 100000)
+death_query
+```
+
+
+## Survival analysis
+
+Please refer to the Jupyter notebook for running this in Python.
+
+##  Filepaths
+
+For many kinds of downstream analysis, you may wish to work with the genome files for that individual, such as the genomic VCFs. If you're working with the aggregate VCFs, you will need the platekeys. 
+
+The original alignments and VCF locations can be found in the `cancer_analysis` table, whereas a realignment using Dragen can be found in `cancer_100K_genomes_realigned_on_pipeline_2` using the participant ID. In this query, we're going to get the tumour platekey, filepath of the somatic small variants VCF for these participants.
+
+```{r}
+filetype <- "somatic_small_variants_vcf_path"
+
+path_sql <- paste("SELECT ca.participant_id, 
+      ca.", filetype, " as ca_filepath, 
+      cr.", filetype, " as dragen_filepath, 
+      ca.tumour_sample_platekey
+    FROM cancer_analysis as ca,
+    cancer_100K_genomes_realigned_on_pipeline_2 as cr
+    WHERE ca.participant_id IN (", part_ids, ")
+    AND ca.participant_id = cr.participant_id", sep="")
+
+path_query <- labkey_to_df(path_sql, version, 100000)
+path_query
+```

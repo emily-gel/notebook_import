@@ -1,0 +1,880 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Building rare disease cohorts with matching controls in R
+
+This notebook will walk you through building rare disease cohorts using the LabKey API in R. You are welcome to copy/paste any code from this notebook for your own scripts/notebooks.
+
+##  Contents:
+
+* Import R libraries you need
+* Helper function to access the LabKey API with R
+* Case cohort
+    * Recruited disease
+    * HPO terms
+    * ICD10 codes
+    * Unsolved cases
+* Control cohort
+    * NOT phenotype
+    * Match demographics
+* General inclusion criteria
+* Filepaths
+
+## Import R libraries you need
+
+```{r}
+library(tidyverse)
+library(Rlabkey)
+library(readr)
+```
+
+## Helper function to access the LabKey API with R
+
+The following R function accesses the LabKey API, executes an SQL query
+to the specified database and returns it as a dataframe. We recommend
+putting this at the beginning of your scripts/notebooks and invoking it
+every time you want to access the database.
+
+```{r}
+labkey_to_df <- function(sql_query, database, maxrows = 100000000){
+    # Retrieve LabKey table based on a user SQL query.
+    # 
+    # Arguments:
+    #       sql_query =   SQL query to ask the data base (character vector
+    #                     of size 1).
+    #       database  =   path containing the version of the programme
+    #                     release to investigate (e.g.: "/main-programme/
+    #                     main-programme_v14_2022-01-27")
+    #       maxrows   =   number of rows to ask from the database. This 
+    #                     parameter defaults to 100000000, but if the
+    #                     output contains exactly the default value, then
+    #                     we suggest increasing this value.
+    
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+```
+
+To run my queries, I'll need to set up my database version:
+
+```{r}
+version <- "main-programme/main-programme_v17_2023-03-30"
+```
+
+## Case cohort
+
+### Recruited disease
+
+We can find participants recruited for a particular disease in the `rare_diseases_participant_disease` table. Here we define an SQL query. We will use as our example ADPKD (autosomal dominant polycystic kidney disease).
+
+We need to start by searching for the `normalised_specific_disease` "Cystic kidney disease".
+
+```{r}
+disease <- "Cystic kidney disease"
+
+recruited_sql <- paste("SELECT participant_id, 
+        normalised_specific_disease, 
+        normalised_disease_sub_group, 
+        normalised_disease_group
+    FROM rare_diseases_participant_disease
+    WHERE normalised_specific_disease = '", 
+    disease, "'", sep="")
+```
+
+Now I can use my SQL query with my version and the helper function to
+retrieve the data and convert it to a dataframe. Lastly, I can print the dataframe.
+
+```{r}
+recruited_query <- labkey_to_df(recruited_sql, version, 100000)
+recruited_query
+```
+
+We will create a list of the participants found with this recruited disease:
+
+```{r}
+recruited_participants <- as.list(recruited_query$participant_id)
+```
+
+
+### HPO terms
+
+We can also find participants who have HPO terms linked to ADPKD. We will query the `rare_diseases_participant_phenotype` table for the following HPO terms:
+
+- Polycystic kidney dysplasia (HP:0000113) 
+- Multiple renal cysts (HP:0005562)
+
+Make sure you include the column `hpo_present` in any query, as this table contains all HPO terms that were checked in the participant, not just those that are present.
+
+```{r}
+hpo_codes <- c("HP:0000113", "HP:0005562")
+
+hpo_sql <- paste("SELECT participant_id, hpo_id, hpo_term
+    FROM rare_diseases_participant_phenotype
+    WHERE hpo_id IN ('", paste(hpo_codes, collapse = "', '"),
+    "') AND hpo_present = 'Yes'",
+    sep = "")
+
+hpo_query <- labkey_to_df(hpo_sql, version, 10000)
+hpo_query
+```
+Again, we will make these into a list.
+
+```{r}
+hpo_participants <- as.list(hpo_query$participant_id)
+```
+
+### ICD10 codes
+
+Lastly, we will search the hospital episode statistics to identify participants with diagnoses in their medical records that indicate ADPKD. We will search for the following codes:
+
+- N28.1 (cyst of kidney) 
+- Q61 (cystic kidney disease)  
+- Q61.2 (polycystic kidney, autosomal dominant)
+
+There are three tables of hospital episode statistics with ICD-10 in the GEL data:
+- `hes_apc`
+- `hes_op`
+- `hes_ae`  
+
+(There is also the `hes_cc` table, but this does not include diagnoses.)
+
+```{r}
+icd_codes <- c('N281', 'Q61', 'Q612')
+hes_tables = c("apc", "op", "ae")
+
+icd_concat <- data.frame()
+
+diag_statement <- paste((icd_codes), collapse = "%' OR diag_all LIKE '%")
+
+for (hes_table in hes_tables) {
+    sqlstr = paste(
+        "SELECT participant_id, diag_all
+        FROM hes_", hes_table,
+        " WHERE diag_all LIKE '%", diag_statement, "%'", sep = "")
+    icd_query <- labkey_to_df(sqlstr, version, 1000000)
+    if (nrow(icd_query) > 0){
+        icd_concat = rbind(icd_query, icd_concat)
+    }
+  }
+
+icd_concat
+```
+
+Now we will pull out the participants from this table, then combine the three lists of participants and remove duplicates.
+
+```{r}
+icd_participants <- as.list(icd_query$participant_id)
+participants <- unique(c(recruited_participants, hpo_participants, icd_participants))
+length(participants)
+part_string = toString(participants)
+```
+
+### Unsolved cases
+
+We can find cases that have been solved, and this has been approved by the GLHs, in the `gmc_exit_questionnaire` table.
+
+I have chosen to query for all cases where `case_solved_family` is not "yes", which will find me all familes where it is also "no", "unknown", "partially" or blank. I am also checking against my list of participants from before.
+
+```{r}
+solved <- "yes"
+
+gmc_sql <- paste(
+    "SELECT participant_id, case_solved_family
+    FROM gmc_exit_questionnaire
+    WHERE participant_id in (", part_string,
+    ") AND case_solved_family != '", solved, "'", sep = "")
+
+gmc_query <- labkey_to_df(gmc_sql, version, 1000)
+gmc_query
+```
+
+Cases that have been solved by RE researchers, but this solution has not yet been approved by the GLHs, can be found in the `submitted_diagnostic_discovery` table. We will now query our list to ensure that none appear in this table.
+
+```{r}
+dd_sql <- paste("SELECT participant_id
+    FROM submitted_diagnostic_discovery
+    WHERE participant_id IN (", 
+    toString(gmc_query$participant_id),
+    ")", sep ="")
+
+dd_query <- labkey_to_df(dd_sql, version, 1000)
+dd_query
+```
+
+We can now generate a list of participants who match our cohort query and do not yet have a genetic diagnosis.
+
+```{r}
+cohort <- as.list((gmc_query %>% filter(!participant_id %in% dd_query$participant_id))$participant_id)
+length(cohort)
+```
+
+## Control cohort
+
+### NOT phenotype
+
+To build our control cohort, we need to exclude all participants who have the phenotype we're interested in. It is best to expand our criteria beyond that that we used to create cohort so that we exclude all phenotypes related to the phenotype of interest. We're going to query many of the same tables as before but at a higher level:
+
+* For recruited disease, we will query a higher level, the `disease_group` in `rare_diseases_participant_disease` for an umbrella term.
+* To exclude participants by HPO terms, we will use the terms we built our cohort with, plus additional more general terms.
+* To exclude participants by events in their medical records, we will exclude:
+    * all participants with an expanded list of ICD10-codes in their diagnoses in the hes tables
+    * All participants who have received treatments relating to the disease of interest              
+    * All participants with related causes of death 
+* We will also exclude all participants with kidney cancer, but searching the cancer tables for "RENAL"
+
+First we will make a list of all participants who DO have these diagnoses, codes and causes of death. 
+
+#### NOT recuited disease
+
+Starting with recruited rare disease, where we will query `normalised_disease_group` for a general term: "Renal and urinary tract disorders".
+
+```{r}
+not_disease <- "Renal and urinary tract disorders"
+
+recruited_not_sql <- paste("SELECT participant_id, 
+        normalised_specific_disease, 
+        normalised_disease_sub_group, 
+        normalised_disease_group
+    FROM rare_diseases_participant_disease
+    WHERE normalised_disease_group = '", 
+    not_disease, "'", sep="")
+
+recruited_not_query <- labkey_to_df(recruited_not_sql, version, 100000)
+recruited_not_list <- as.list( recruited_not_query$participant_id)
+length(recruited_not_list)
+```
+
+#### NOT HPO phenotypes
+
+Now we search the `rare_diseases_participant_phenotype` table for the expanded list of HPO terms:
+
+* Polycystic kidney dysplasia (HP:0000113)
+* Multicystic kidney dysplasia (HP:0000003)
+* Multiple renal cysts (HP:0005562)
+* **Abnormality of the kidney (HP:0000077)**
+
+```{r}
+hpo_not_codes <- c("HP:0000113", "HP:0000003", "HP:0005562", "HP:0000077")
+
+hpo_not_sql <- paste("SELECT participant_id, hpo_id, hpo_term
+    FROM rare_diseases_participant_phenotype
+    WHERE hpo_id IN ('", paste(hpo_not_codes, collapse = "', '"),
+    "') AND hpo_present = 'Yes'",
+    sep = "")
+
+hpo_not_query <- labkey_to_df(hpo_not_sql, version, 100000)
+hpo_not_list <- as.list( hpo_not_query$participant_id)
+length(hpo_not_list)
+```
+
+#### NOT diagnoses, treatments or causes of death in secondary clinical data
+
+We will search for diagnoses in the secondary clinical data, again using an expanded list of terms:
+- N19 Unspecified renal failure 
+- Y84.1 Kidney dialysis 
+- N18.5 Chronic kidney disease, stage 5 
+- N28.1 (cyst of kidney) 
+- Q61 (cystic kidney disease)  
+- Q61.2 (polycystic kidney, autosomal dominant)  
+- Q61.3 (polycystic kidney, unspecified)  
+- Q61.8 (other cystic kidney diseases) 
+- Q61.9 (cystic kidney disease, unspecified)
+
+```{r}
+icd_not_codes <- c('N281', 'Q61', 'Q612', 'Q613', 'Q618', 'Q619', 'N19', 'Y841', 'N185')
+hes_tables = c("apc", "op", "ae")
+
+icd_not_concat <- data.frame()
+
+diag_not_statement <- paste((icd_not_codes), collapse = "%' OR diag_all LIKE '%")
+
+for (hes_table in hes_tables) {
+    sqlstr = paste(
+        "SELECT participant_id, diag_all
+        FROM hes_", hes_table,
+        " WHERE diag_all LIKE '%", diag_not_statement, "%'", sep = "")
+    icd_query <- labkey_to_df(sqlstr, version, 1000000)
+    if (nrow(icd_query) > 0){
+        icd_not_concat <- rbind(icd_query, icd_not_concat)
+    }
+  }
+
+icd_not_list <- as.list( icd_not_concat$participant_id)
+length(icd_not_list)
+```
+
+We will search the same hes tables for treatments relating to kidney disease:
+- M01 Transplantation of kidney 
+- M01.1 Autotransplantation of kidney 
+- M01.2 Allotransplantation of kidney from live donor 
+- M01.3 Allotransplantation of kidney from cadaver NEC 
+- M01.4 Allotransplantation of kidney from cadaver heart beating 
+- M01.5 Allotransplantation of kidney from cadaver heart non-beating 
+- M01.8 Other specified transplantation of kidney 
+- M01.9 Unspecified transplantation of kidney 
+- X40.1 Renal dialysis 
+
+```{r}
+not_opcs <- c('M01', 'M011', 'M012', 'M013', 'M014', 'M015', 'M018', 'M019', 'X401')
+opcs_hes = c("apc", "op")
+
+opcs_not_concat <- data.frame()
+opcs_not_statement <- paste((not_opcs), collapse = "%' OR opertn_all LIKE '%")
+
+for (hes_table in opcs_hes) {
+    sqlstr = paste(
+        "SELECT participant_id, opertn_all
+        FROM hes_", hes_table,
+        " WHERE opertn_all LIKE '%", opcs_not_statement, "%'", sep = "")
+    opcs_query <- labkey_to_df(sqlstr, version, 1000000)
+    if (nrow(opcs_query) > 0){
+        opcs_not_concat = rbind(opcs_query, opcs_not_concat)
+    }
+  }
+
+opcs_not_list <- as.list( opcs_not_concat$participant_id)
+length(opcs_not_list)
+```
+
+We also want to exclude participants who have died of kidney related diseases, so we will use the `mortality` tablw to exclude:
+- N19 Unspecified renal failure 
+- N28.1 Cyst of kidney 
+- Q61 Cystic kidney disease 
+- Q61.2 Polycystic kidney, autosomal dominant 
+- Q61.3 Polycystic kidney, unspecified 
+- Q61.8 Other cystic kidney diseases 
+- Q61.9 Cystic kidney disease, unspecified
+
+```{r}
+not_death_icd = c('N19', 'N281', 'Q61', 'Q612', 'Q613', 'Q618', 'Q619')
+
+mortality_not_statement <- paste((not_death_icd), collapse = "%' OR icd10_multiple_cause_all LIKE '%")
+
+mortality_not_sql <- paste(
+        "SELECT participant_id, icd10_multiple_cause_all
+        FROM mortality 
+        WHERE icd10_multiple_cause_all LIKE '%", mortality_not_statement, "%'", sep = "")
+
+mortality_not_query <- labkey_to_df(mortality_not_sql, version, 100000)
+mortality_not_list <- as.list( mortality_not_query$participant_id)
+length(mortality_not_list)
+```
+
+#### NOT related cancers
+
+We will exclude all cancer participants with related cancers.
+
+```{r}
+cancer_not_type <- "RENAL"
+cancer_not_sql <- paste("SELECT   participant_id, disease_type, study_abbreviation ",
+ "FROM cancer_analysis ",
+ "WHERE disease_type='", cancer_not_type, "'", sep="")
+
+cancer_not_query <- labkey_to_df(cancer_not_sql, version, 100000)
+cancer_not_list <- as.list( cancer_not_query$participant_id)
+length(cancer_not_list)
+```
+
+#### Combine and exclude
+
+We can combine all these into a single list:
+
+```{r}
+not_list <- unique(c(recruited_not_list, hpo_not_list, icd_not_list, opcs_not_list, mortality_not_list, cancer_not_list))
+length(not_list)
+```
+
+Now we can pull out all the participants from the `participant` table and remove our exclusion list to give only the participants who do NOT match the criteria. Note that we have pulled the whole participant list then excluded afterwards, rather than including our exclusion list in our SQL statement, as this SQL would be too long to be processed.
+
+```{r}
+participant_sql <- 'SELECT participant_id FROM participant'
+participant_list <- as.list(labkey_to_df(participant_sql, version, 1000000)$participant_id)
+control <- participant_list[ ! participant_list %in% not_list]
+length(control)
+```
+
+### Match demographics
+
+We will match on age and sex. We will get the year of birth for the case and control cohorts, and calculate their mean years of birth. We will also pull out the phenotyped and genotyped sex.
+
+```{r}
+case_sql <- paste("SELECT participant_id, yob, 
+    participant_phenotyped_sex, participant_karyotyped_sex
+    FROM participant_summary
+    WHERE participant_id IN (", toString(cohort), ")", 
+    sep = "")
+case_query <- unique(labkey_to_df(case_sql, version, 10000))
+case_yob_mean = mean(strtoi(case_query$yob))
+
+control_sql <- paste("SELECT participant_id, yob, 
+    participant_phenotyped_sex, participant_karyotyped_sex
+    FROM participant_summary
+    WHERE participant_id IN (", toString(control), ")", 
+    sep = "")
+control_query <- unique(labkey_to_df(control_sql, version, 10000))
+control_yob_mean = mean(strtoi(control_query$yob))
+
+cat("case mean = ", case_yob_mean, "\ncontrol mean = ", control_yob_mean)
+```
+
+These means are close enough. We will now count the number of male and female participants in each group.
+
+```{r}
+cat("case XX = ", sum(case_query$participant_karyotyped_sex == "XX")/nrow(case_query), 
+    "\ncase Female = ", sum(case_query$participant_phenotyped_sex == "Female")/nrow(case_query),
+    "\ncase XY = ", sum(case_query$participant_karyotyped_sex == "XY")/nrow(case_query), 
+    "\ncase Male = ", sum(case_query$participant_phenotyped_sex == "Male")/nrow(case_query),
+    "\ncontrol XX = ", sum(control_query$participant_karyotyped_sex == "XX")/nrow(control_query), 
+    "\ncontrol Female = ", sum(control_query$participant_phenotyped_sex == "Female")/nrow(control_query),
+    "\ncontrol XY = ", sum(control_query$participant_karyotyped_sex == "XY")/nrow(control_query), 
+    "\ncontrol Male = ", sum(control_query$participant_phenotyped_sex == "Male")/nrow(control_query))
+
+```
+
+These are also close enough to go forward with.
+
+To ensure that the cohort is ethnically matched, we will filter to include only a single ethnicity for both case and control. In this case we will use European ethnicity. We will use the above threshold genetically determined ethnicity.
+
+```{r}
+eth <- "European"
+
+case_ethnicity_sql <- paste("SELECT participant_id, genetically_inferred_ancestry_thr
+    FROM participant_summary
+    WHERE genetically_inferred_ancestry_thr = '", eth, "'
+    AND participant_id IN (", toString(cohort), ")", sep ="")
+case_ethnicity_query <- unique(labkey_to_df(case_ethnicity_sql, version, 10000))
+filtered_case <- case_ethnicity_query$participant_id
+
+control_ethnicity_sql <- paste("SELECT participant_id, genetically_inferred_ancestry_thr
+    FROM participant_summary
+    WHERE genetically_inferred_ancestry_thr = '", eth, "'
+    AND participant_id IN (", toString(control), ")", sep ="")
+control_ethnicity_query <- unique(labkey_to_df(control_ethnicity_sql, version, 100000))
+filtered_control <- control_ethnicity_query$participant_id
+```
+
+## General inclusion criteria
+
+We're now going to filter both case and control cohorts by some general criteria. First we will join the two cohorts to a single dataframe with case or control added as column.
+
+```{r}
+case_ethnicity_query$case <- "case"
+control_ethnicity_query$case <- "control"
+
+case_control_table <- subset( rbind(case_ethnicity_query, control_ethnicity_query), select = c(participant_id, case))
+case_control_table
+```
+
+We will first do some QC filtering. We want to include only participants who are XX or XY and whose phenotyped sex matches their genetic sex. We will include a filter for XX or XY in our SQL query, then drop any rows with XX Male or XY Female.
+
+```{r}
+sex_sql <- paste("SELECT participant_id, participant_phenotyped_sex, participant_karyotyped_sex
+    FROM participant_summary
+    WHERE participant_id IN (",  toString(as.list(case_control_table$participant_id)), 
+    ") AND (participant_karyotyped_sex = 'XX'
+    OR participant_karyotyped_sex = 'XY')", sep= "")
+
+sex_query <- labkey_to_df(sex_sql, version, 100000)
+
+female_query <- subset (sex_query, participant_phenotyped_sex == 'Female' & participant_karyotyped_sex == 'XX')
+male_query <- subset (sex_query, participant_phenotyped_sex == 'Male' & participant_karyotyped_sex == 'XY')
+sex_list <- c(as.list(female_query$participant_id), as.list(male_query$participant_id))
+
+case_control_table <- filter(case_control_table, participant_id %in% sex_list)
+case_control_table
+```
+
+We will further filter by sample extraction methods. We are interested in samples taken as blood, using EDTA extraction and with PCR-free sequencing.
+
+We will do this using the `aggregate_gvcf_sample_stats` table. This has the added benefit that we will also filter to only include participants included in the AggV2 aggregate VCF files, which may be very useful if you want to use AggV2, which also means all participants have their genomes aligned to GRCh38.
+
+```{r}
+aggregate_sql = paste("SELECT participant_id, platekey
+    FROM aggregate_gvcf_sample_stats
+    WHERE participant_id IN(",  toString(case_control_table$participant_id), 
+    ") AND sample_source = 'BLOOD'
+    AND sample_preparation_method = 'EDTA'
+    AND sample_library_type = 'TruSeq PCR-Free High Throughput'", sep = "")
+aggregate_query <- labkey_to_df(aggregate_sql, version, 100000)
+case_control_table <- unique(merge(case_control_table, aggregate_query))
+case_control_table
+```
+
+We need to check the relatedness between members of our cohort. To do this we can load the relatedness files that were calculated for the aggregated gVCFs.
+
+```{r}
+relatedness_table = read_tsv('/gel_data_resources/main_programme/aggregation/aggregate_gVCF_strelka/aggV2/additional_data/PCs_relatedness/relatedness/GEL_aggV2_MAF5_mp10_0.0442.kin0')
+relatedness_table
+```
+
+We're going to find all the monozygotic twins in the table by pulling out all of those where kinship is greater than 0.345.
+
+```{r}
+mz_twins_table <- relatedness_table %>% filter(KINSHIP > 0.354)
+mz_twins_table
+```
+
+Now we need to identify if any of these twins are in our cohort. If they are, we need to determine if either or both of the twins are affected by the phenotype of interest. If one of them is, we will keep that twin in our case cohort and discard the other. If both are affected, we will discard one at random.
+
+```{r}
+twins_list <- split((mz_twins_table %>% select('IID1','IID2')), seq(nrow(mz_twins_table %>% select('IID1','IID2'))))
+
+case_control_list <- as.list(case_control_table$platekey)
+
+for (twins in twins_list) {
+  if (twins$IID1 %in% case_control_list) {
+    row <- case_control_table[case_control_table$platekey == twins$IID1 ,] 
+    if (row$case == 'case'){
+      case_control_table <- case_control_table[case_control_table$platekey != twins$IID2,]
+      
+    }
+  } else if (twins$IID2 %in% case_control_list){
+    row <- case_control_table[case_control_table$platekey == twins$IID2 ,] 
+    if (row$case == 'case'){
+      case_control_table <- case_control_table[case_control_table$platekey != twins$IID1,]
+    }
+  }
+}
+
+case_control_table
+```
+
+##  Filepaths
+
+For many kinds of downstream analysis, you may wish to work with the genome files for that individual, such as the genomic VCFs. If you're working with the aggregate VCFs, you will need the platekeys. 
+
+In this query, we're going to get the platekey and filepath of the gVCF for these participants.
+
+```{r}
+filetype <- "Genomic VCF"
+
+path_sql <- paste("SELECT participant_id, 
+      platekey, filename, file_path
+    FROM genome_file_paths_and_types
+    WHERE participant_id IN (", toString(case_control_table$participant_id), ")
+    AND file_sub_type = '", filetype, "'" , sep="")
+
+path_query <- labkey_to_df(path_sql, version, 100000)
+case_control_table_paths <- merge(case_control_table, path_query)
+case_control_table_paths
+```
+
+## Optional exercise
+
+To extend your learning, we have included an exercise here to practice building a rare disease cohort. Please make use of the code included in this notebook and modify where relevant.
+
+1. Build a cohort of all participants in Genomics England with Motor Neurone Disease/Amyotrophic Lateral Sclerosis. You should search for all participants recruited to Genomics England for ALS, all participants with the HPO term `HP:0007354` and all diagnoses of the ICD10 code `G12.2` in their medical history.
+2. Narrow down your cohort to only include those who do not yet have a genetic diagnosis. You should check for diagnoses that have been approved by the GLHs, and also those who have diagnoses submitted by researchers.
+3. Create a control cohort of participants without ALS. You should expand the search criteria to exclude all participants with similar phenotypes:
+    a. Use the disease group to search for participants not recruited for diseases related to ALS.
+    b. Find the parent term of the HPO term `HP:0007354` and any other child terms of that parent (https://hpo.jax.org/app/). Use these to exclude participants.
+    c. Find related terms to the ICD10 code `G12.2` (look at https://phewascatalog.org/phecodes_icd10 to find related codes) and search both medical history and causes of death to exclude participants.
+4. Get the mean age and sex ratios of your case and control cohorts. Ensure that these are broadly similar. Filter both cohorts to only include participants of European ancestry.
+5. Check that all of your cohort have genomes aligned to GRCh38, are in AggV2, have no sex chromosome aneuploidies and their phenotypic sex matches their sex chromosomes, had samples taken as blood, using EDTA extraction and with PCR-free sequencing and that you only have one of any pair of monozygotic twins, prioritising affected participants.
+6. Get the filepaths of the BAM files for all participants in the case and control cohorts.
+
+### A possible solution
+
+```{r}
+# Import modules
+library(tidyverse)
+library(Rlabkey)
+library(readr)
+
+# create helper function
+labkey_to_df <- function(sql_query, database, maxrows){
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+
+# define database version
+version <- "main-programme/main-programme_v17_2023-03-30"
+
+# 1. Build a cohort of all participants in Genomics England
+# with Motor Neurone Disease/Amyotrophic Lateral Sclerosis.
+# You should search for all participants recruited to Genomics
+# England for ALS, all participants with the HPO term
+# `HP:0007354` and all diagnoses of the ICD10 code `G12.2`
+# in their medical history.
+
+als_disease <- "Amyotrophic lateral sclerosis or motor neuron disease"
+
+als_recruited_sql <- paste("SELECT participant_id, 
+        normalised_specific_disease, 
+        normalised_disease_sub_group, 
+        normalised_disease_group
+    FROM rare_diseases_participant_disease
+    WHERE normalised_specific_disease = '", 
+    als_disease, "'", sep="")
+als_recruited_query <- labkey_to_df(als_recruited_sql, version, 100000)
+als_recruited_participants <- as.list(als_recruited_query$participant_id)
+
+als_hpo_code <- "HP:0007354"
+
+als_hpo_sql <- paste("SELECT participant_id, hpo_id, hpo_term
+    FROM rare_diseases_participant_phenotype
+    WHERE hpo_id = '", als_hpo_code,
+    "' AND hpo_present = 'Yes'",
+    sep = "")
+
+als_hpo_query <- labkey_to_df(als_hpo_sql, version, 10000)
+als_hpo_participants <- as.list(als_hpo_query$participant_id)
+
+als_icd_codes <- c('G122')
+hes_tables = c("apc", "op", "ae")
+
+als_icd_concat <- data.frame()
+
+als_diag_statement <- paste((als_icd_codes), collapse = "%' OR diag_all LIKE '%")
+
+for (hes_table in hes_tables) {
+    sqlstr = paste(
+        "SELECT participant_id, diag_all
+        FROM hes_", hes_table,
+        " WHERE diag_all LIKE '%", diag_statement, "%'", sep = "")
+    icd_query <- labkey_to_df(sqlstr, version, 1000000)
+    if (nrow(icd_query) > 0){
+        als_icd_concat = rbind(icd_query, als_icd_concat)
+    }
+  }
+als_icd_participants <- as.list(als_icd_concat$participant_id)
+
+als_participants <- unique(c(als_recruited_participants, als_hpo_participants, als_icd_participants))
+length(als_participants)
+als_part_string = toString(als_participants)
+
+# 2. Narrow down your cohort to only include those who do not
+# yet have a genetic diagnosis. You should check for diagnoses
+# that have been approved by the GLHs, and also those who have
+# diagnoses submitted by researchers.
+
+solved <- "yes"
+
+als_gmc_sql <- paste(
+    "SELECT participant_id, case_solved_family
+    FROM gmc_exit_questionnaire
+    WHERE participant_id in (", als_part_string,
+    ") AND case_solved_family != '", solved, "'", sep = "")
+als_gmc_query <- labkey_to_df(als_gmc_sql, version, 1000)
+
+als_dd_sql <- paste("SELECT participant_id
+    FROM submitted_diagnostic_discovery
+    WHERE participant_id IN (", 
+    toString(als_gmc_query$participant_id),
+    ")", sep ="")
+
+als_dd_query <- labkey_to_df(als_dd_sql, version, 1000)
+
+als_cohort <- as.list((als_gmc_query %>% filter(!participant_id %in% als_dd_query$participant_id))$participant_id)
+length(als_cohort)
+
+# 3. Create a control cohort of participants without ALS. You
+# should expand the search criteria to exclude all participants
+# with similar phenotypes:
+#     a. Use the disease group to search for participants not
+#     recruited for diseases related to ALS.
+
+als_not_disease <- "Neurology and neurodevelopmental disorders"
+
+als_recruited_not_sql <- paste("SELECT participant_id, 
+        normalised_specific_disease, 
+        normalised_disease_sub_group, 
+        normalised_disease_group
+    FROM rare_diseases_participant_disease
+    WHERE normalised_disease_group = '", 
+    als_not_disease, "'", sep="")
+
+als_recruited_not_query <- labkey_to_df(als_recruited_not_sql, version, 100000)
+als_recruited_not_list <- as.list( als_recruited_not_query$participant_id)
+
+#     b. Find the parent term of the HPO term `HP:0007354` and
+# any other child terms of that parent 
+# (https://hpo.jax.org/app/). Use these to exclude participants.
+
+als_hpo_not_codes <- c("HP:0007354", "HP:0007373", "HP:0002398")
+
+als_hpo_not_sql <- paste("SELECT participant_id, hpo_id, hpo_term
+    FROM rare_diseases_participant_phenotype
+    WHERE hpo_id IN ('", paste(als_hpo_not_codes, collapse = "', '"),
+    "') AND hpo_present = 'Yes'",
+    sep = "")
+
+als_hpo_not_query <- labkey_to_df(als_hpo_not_sql, version, 100000)
+als_hpo_not_list <- as.list( als_hpo_not_query$participant_id)
+
+#     c. Find related terms to the ICD10 code `G12.2` (look at
+# https://phewascatalog.org/phecodes_icd10 to find related
+# codes) and search both medical history and causes of death
+# to exclude participants.
+
+als_icd_not_codes <- c('G12', 'G121', 'G122', 'G128', 'G129')
+
+als_icd_not_concat <- data.frame()
+
+als_diag_not_statement <- paste((als_icd_not_codes), collapse = "%' OR diag_all LIKE '%")
+
+for (hes_table in hes_tables) {
+    sqlstr = paste(
+        "SELECT participant_id, diag_all
+        FROM hes_", hes_table,
+        " WHERE diag_all LIKE '%", als_diag_not_statement, "%'", sep = "")
+    icd_query <- labkey_to_df(sqlstr, version, 1000000)
+    if (nrow(icd_query) > 0){
+        als_icd_not_concat <- rbind(icd_query, als_icd_not_concat)
+    }
+  }
+
+als_icd_not_list <- as.list( als_icd_not_concat$participant_id)
+
+als_mortality_not_statement <- paste((als_icd_not_codes), collapse = "%' OR icd10_multiple_cause_all LIKE '%")
+
+als_mortality_not_sql <- paste(
+        "SELECT participant_id, icd10_multiple_cause_all
+        FROM mortality 
+        WHERE icd10_multiple_cause_all LIKE '%", als_mortality_not_statement, "%'", sep = "")
+
+als_mortality_not_query <- labkey_to_df(als_mortality_not_sql, version, 100000)
+als_mortality_not_list <- as.list( als_mortality_not_query$participant_id)
+
+als_not_list <- unique(c(als_recruited_not_list, als_hpo_not_list, als_icd_not_list, als_mortality_not_list))
+
+participant_sql <- 'SELECT participant_id FROM participant'
+participant_list <- as.list(labkey_to_df(participant_sql, version, 1000000)$participant_id)
+als_control <- participant_list[ ! participant_list %in% als_not_list]
+length(als_control)
+
+# 4. Get the mean age and sex ratios of your case and control
+# cohorts. Ensure that these are broadly similar. Filter both
+# cohorts to only include participants of European ancestry.
+
+als_case_sql <- paste("SELECT participant_id, yob, 
+    participant_phenotyped_sex, participant_karyotyped_sex
+    FROM participant_summary
+    WHERE participant_id IN (", toString(als_cohort), ")", 
+    sep = "")
+als_case_query <- unique(labkey_to_df(als_case_sql, version, 10000))
+als_case_yob_mean = mean(strtoi(als_case_query$yob))
+
+als_control_sql <- paste("SELECT participant_id, yob, 
+    participant_phenotyped_sex, participant_karyotyped_sex
+    FROM participant_summary
+    WHERE participant_id IN (", toString(als_control), ")", 
+    sep = "")
+als_control_query <- unique(labkey_to_df(als_control_sql, version, 10000))
+als_control_yob_mean = mean(strtoi(als_control_query$yob))
+
+cat("case mean = ", als_case_yob_mean, "\ncontrol mean = ", als_control_yob_mean)
+
+cat("case XX = ", sum(als_case_query$participant_karyotyped_sex == "XX")/nrow(als_case_query), 
+    "\ncase Female = ", sum(als_case_query$participant_phenotyped_sex == "Female")/nrow(als_case_query),
+    "\ncase XY = ", sum(als_case_query$participant_karyotyped_sex == "XY")/nrow(als_case_query), 
+    "\ncase Male = ", sum(als_case_query$participant_phenotyped_sex == "Male")/nrow(als_case_query),
+    "\ncontrol XX = ", sum(als_control_query$participant_karyotyped_sex == "XX")/nrow(als_control_query), 
+    "\ncontrol Female = ", sum(als_control_query$participant_phenotyped_sex == "Female")/nrow(als_control_query),
+    "\ncontrol XY = ", sum(als_control_query$participant_karyotyped_sex == "XY")/nrow(als_control_query), 
+    "\ncontrol Male = ", sum(als_control_query$participant_phenotyped_sex == "Male")/nrow(als_control_query))
+
+eth <- "European"
+
+als_case_ethnicity_sql <- paste("SELECT participant_id, genetically_inferred_ancestry_thr
+    FROM participant_summary
+    WHERE genetically_inferred_ancestry_thr = '", eth, "'
+    AND participant_id IN (", toString(als_cohort), ")", sep ="")
+als_case_ethnicity_query <- unique(labkey_to_df(als_case_ethnicity_sql, version, 10000))
+als_filtered_case <- als_case_ethnicity_query$participant_id
+
+als_control_ethnicity_sql <- paste("SELECT participant_id, genetically_inferred_ancestry_thr
+    FROM participant_summary
+    WHERE genetically_inferred_ancestry_thr = '", eth, "'
+    AND participant_id IN (", toString(als_control), ")", sep ="")
+als_control_ethnicity_query <- unique(labkey_to_df(als_control_ethnicity_sql, version, 100000))
+als_filtered_control <- als_control_ethnicity_query$participant_id
+
+# 5. Check that all of your cohort have genomes aligned to
+# GRCh38, are in AggV2, have no sex chromosome aneuploidies
+# and their phenotypic sex matches their sex chromosomes, had
+# samples taken as blood, using EDTA extraction and with
+# PCR-free sequencing and that you only have one of any pair
+# of monozygotic twins, prioritising affected participants.
+
+als_case_ethnicity_query$case <- "case"
+als_control_ethnicity_query$case <- "control"
+
+als_case_control_table <- subset( rbind(als_case_ethnicity_query, als_control_ethnicity_query), select = c(participant_id, case))
+
+als_sex_sql <- paste("SELECT participant_id, participant_phenotyped_sex, participant_karyotyped_sex
+    FROM participant_summary
+    WHERE participant_id IN (",  toString(as.list(als_case_control_table$participant_id)), 
+    ") AND (participant_karyotyped_sex = 'XX'
+    OR participant_karyotyped_sex = 'XY')", sep= "")
+
+als_sex_query <- labkey_to_df(als_sex_sql, version, 100000)
+
+als_female_query <- subset (als_sex_query, participant_phenotyped_sex == 'Female' & participant_karyotyped_sex == 'XX')
+als_male_query <- subset (als_sex_query, participant_phenotyped_sex == 'Male' & participant_karyotyped_sex == 'XY')
+als_sex_list <- c(as.list(als_female_query$participant_id), as.list(als_male_query$participant_id))
+
+als_case_control_table <- filter(als_case_control_table, participant_id %in% als_sex_list)
+
+als_aggregate_sql = paste("SELECT participant_id, platekey
+    FROM aggregate_gvcf_sample_stats
+    WHERE participant_id IN(",  toString(als_case_control_table$participant_id), 
+    ") AND sample_source = 'BLOOD'
+    AND sample_preparation_method = 'EDTA'
+    AND sample_library_type = 'TruSeq PCR-Free High Throughput'", sep = "")
+als_aggregate_query <- labkey_to_df(als_aggregate_sql, version, 100000)
+als_case_control_table <- unique(merge(als_case_control_table, als_aggregate_query))
+
+relatedness_table = read_tsv('/gel_data_resources/main_programme/aggregation/aggregate_gVCF_strelka/aggV2/additional_data/PCs_relatedness/relatedness/GEL_aggV2_MAF5_mp10_0.0442.kin0')
+mz_twins_table <- relatedness_table %>% filter(KINSHIP > 0.354)
+
+twins_list <- split((mz_twins_table %>% select('IID1','IID2')), seq(nrow(mz_twins_table %>% select('IID1','IID2'))))
+
+als_case_control_list <- as.list(als_case_control_table$platekey)
+
+for (twins in twins_list) {
+  if (twins$IID1 %in% als_case_control_list) {
+    row <- als_case_control_table[als_case_control_table$platekey == twins$IID1 ,] 
+    if (row$case == 'case'){
+      als_case_control_table <- als_case_control_table[als_case_control_table$platekey != twins$IID2,]
+      
+    }
+  } else if (twins$IID2 %in% case_control_list){
+    row <- case_control_table[case_control_table$platekey == twins$IID2 ,] 
+    if (row$case == 'case'){
+      als_case_control_table <- als_case_control_table[als_case_control_table$platekey != twins$IID1,]
+    }
+  }
+}
+
+als_case_control_table
+
+# 6. Get the filepaths of the BAM files for all participants
+# in the case and control cohorts.
+
+als_filetype <- "BAM"
+
+als_path_sql <- paste("SELECT participant_id, 
+      platekey, filename, file_path
+    FROM genome_file_paths_and_types
+    WHERE participant_id IN (", toString(als_case_control_table$participant_id), ")
+    AND file_sub_type = '", filetype, "'" , sep="")
+
+als_path_query <- labkey_to_df(als_path_sql, version, 100000)
+als_case_control_paths <- merge(als_case_control_table, als_path_query)
+als_case_control_paths
+```

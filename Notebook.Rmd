@@ -1,0 +1,380 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Finding participants by genotypes in R
+
+This notebook will walk you through finding participants by genotypes. You are welcome to copy/paste any code from this notebook for your own scripts/notebooks.
+
+## Contents:
+
+* Use the LabKey API
+    * Import R libraries you need
+    * Helper function to access the LabKey API with R
+    * Querying the tiering_data table
+    * Querying the exomiser table
+    * Querying the cancer_tier_and_domain_variants table
+    * Querying the NHS GMS tiering_data table
+* Running workflows on the HPC
+* Using bcftools on the HPC
+* Optional exercise
+
+## Use the LabKey API
+
+### Import R libraries you need
+
+```{r}
+library(tidyverse)
+library(Rlabkey)
+```
+
+### Helper function to access the LabKey API with R
+
+The following R function accesses the LabKey API, executes an SQL query to the specified database and returns it as a dataframe. We recommend putting this at the beginning of your scripts/notebooks and invoking it every time you want to access the database.
+
+```{r}
+labkey_to_df <- function(sql_query, database, maxrows){
+    # Retrieve LabKey table based on a user SQL query.
+    # 
+    # Arguments:
+    #       sql_query =   SQL query to ask the data base (character vector
+    #                     of size 1).
+    #       database  =   path containing the version of the programme
+    #                     release to investigate (e.g.: "/main-programme/
+    #                     main-programme_v14_2022-01-27")
+    #       maxrows   =   number of rows to ask from the database. This 
+    #                     parameter defaults to 100000000, but if the
+    #                     output contains exactly the default value, then
+    #                     we suggest increasing this value.
+    
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+```
+
+To run my queries, I'll need to set up my database version:
+
+```{r}
+version <- "main-programme/main-programme_v17_2023-03-30"
+```
+
+### Querying the tiering data table
+
+Here we define a simple query to fetch all participants with tiered variants in a gene. I have defined the gene as a string, making it easy for you to copy and edit this query.
+
+```{r}
+gene <- "NIPBL"
+tiering_sql <- paste("SELECT participant_id, phenotype, assembly, chromosome, position, reference, alternate, genotype ",
+ "FROM tiering_data ",
+ "WHERE genomic_feature_hgnc='", gene, "'", sep="")
+```
+
+Now I can use my SQL query with my version and the helper function to retrieve the data and convert it to a dataframe. Lastly, I can print the dataframe.
+
+```{r}
+tiering_query <- labkey_to_df(tiering_sql, version, 10000)
+tiering_query
+```
+
+The following query finds participants with variants at a particular locus. Since some participants' genomes have been aligned to GRCh37 and most to GRCh38, we need to specify the genome assembly in this query, and to recognise that we won't find participants whose genomes are on
+the other assembly.
+
+```{r}
+chromosome <- "5"
+coordinate <- "37064560"
+assembly <- "GRCh38"
+
+locus_tiering_sql <- paste("SELECT participant_id, phenotype, genomic_feature_hgnc, genotype ",
+    "FROM tiering_data ",
+    "WHERE chromosome = '", chromosome, 
+      "' AND position = '", coordinate, 
+      "' AND assembly = '", assembly, "'", sep="")
+
+locus_tiering_query <- labkey_to_df(locus_tiering_sql, version, 10000)
+locus_tiering_query
+```
+
+### Querying the exomiser table
+
+The exomiser table allows you to search for participants by locus or gene, just like the tiering table. However, it also contains HGVS notation for variants in the form:
+
+\`gene_name:ENST0000000\#\#\#\#:c.99A\>T:p.(Gly33Glu)\`
+
+```{r}
+gene_name <- "MUM1L1"
+aa_change <- "Leu7Gln"
+
+exomiser_hgvs_sql <- paste( "SELECT participant_id, phenotype, assembly, chromosome, position, hgvs, reference, alternate, genotype ",
+    "FROM exomiser ",
+    " WHERE hgvs like '%", gene_name, 
+    "%' AND hgvs like '%", aa_change, "%'",
+    sep="")
+
+exomiser_hgvs_query <- labkey_to_df(exomiser_hgvs_sql, version, 10000)
+exomiser_hgvs_query
+```
+
+### Querying the cancer_tier_and_domain_variants table
+
+Now we'll query the cancer_tier_and_domain_variants. This has a similar structure to the rare disease tiering table, so we can query it for a gene and/or region in the same way.
+
+```{r}
+cancer_gene <- "TP53"
+
+cancer_gene_tiering_sql = paste( "SELECT participant_id, disease_type, chr, pos, ref, alt
+    FROM cancer_tier_and_domain_variants
+    WHERE gene = '", cancer_gene, "'
+    ", sep = "")
+cancer_gene_tiering_query <- labkey_to_df(cancer_gene_tiering_sql, version, 10000)
+cancer_gene_tiering_query
+```
+
+Since all cancer genomes are aligned to GRCh38, querying by a locus does not require the assembly argument.
+
+```{r}
+cancer_chromosome <- "17"
+cancer_coordinate <- "7675166"
+
+cancer_locus_tiering_sql <- paste("SELECT participant_id, disease_type, gene
+    FROM cancer_tier_and_domain_variants
+    WHERE chr = '", cancer_chromosome, "' 
+      AND pos = '", cancer_coordinate, "'
+    ", sep = "")
+
+cancer_locus_tiering_query <- labkey_to_df(cancer_locus_tiering_sql, version, 10000)
+cancer_locus_tiering_query
+```
+
+### Querying the NHS GMS tiering_data table
+
+Again, the structure is very similar to that in 100k, but we don't need to fetch the assembly as all genomes are aligned to GRCh38. We have to make a new version object for the NHS GMS database.
+
+```{r}
+gms_version <- "nhs-gms/nhs-gms-release_v2_2023-02-28"
+
+gms_gene_tiering_sql <- paste("SELECT participant_id, phenotype, chromosome, position, reference, alternate, genotype
+    FROM tiering_data
+    WHERE genomic_feature_hgnc = '", gene, "'
+    ", sep = "")
+
+gms_gene_tiering_query <- labkey_to_df(gms_gene_tiering_sql, gms_version, 10000)
+gms_gene_tiering_query
+```
+
+## Running workflows on the HPC
+
+### Small variant workflow
+
+* `ssh` to the HPC with your usual login credentials
+* `cd` into your working directory
+* Make and cd into your working directory
+    * `mkdir small_variant_demo`
+    * `cd small_variant_demo`
+* Copy the Small Variant workflow submission script into your folder
+    * `/pgen_int_data_resources/workflows/rdp_small_variant/main/submit.sh .`
+* Make the file `gene_list.txt` and add your list of genes to it
+    * `vi gene_list.txt`
+    * Add `SMC3` to the file
+    * `Esc :wq`
+* Edit the submission script:
+   * `vi submit.sh`
+   * Change the `project_code` to your code
+   * Change the `gene_input` to `gene_list.txt`
+   *`Esc :wq`
+* Run the workflow
+    * `bsub < submit.sh`
+* Find your results when the job is finished
+
+### SV/CNV workflow
+
+* `ssh` to the HPC with your usual login credentials
+* `cd` into your working directory
+* Copy the SV/CNV workflow and cd into your folder
+  * `cp -R /gel_data_resources/workflows/BRS_tools_svcnvWorkflow/v2.0.1/ svcnv_demo`
+  * `cd svcnv_demo`
+* Edit the file `input/gene_list.txt`
+  * `vi input/gene_list.txt`
+  * Add `SMC3` to the file
+  * `Esc :wq`
+* Edit the submission script:
+  * `vi submit_script.sh`
+  * Change the `project_code` to your code
+  * `Esc :wq`
+* Run the workflow
+  * `bsub < submit_script.sh`
+* Find your results when the job is finished
+
+## Using bcftools on the HPC
+
+* `ssh` to the HPC with your usual login credentials
+* `cd` into your working directory
+* Create a BED file of your variant locus
+   * `vi variant_region.bed`
+  * `chr5    37064560        37064560        variant`
+  * `Esc :wq`
+* Find and load the latest version of bedtools
+  * `module avail bedtools`
+  * `module load <latest version full path>`
+* Use bedtools to find the relevant chunk
+  * `bedtools intersect -wo -a variant_region.bed -b /gel_data_resources/main_programme/aggregation/aggregate_gVCF_strelka/aggV2/additional_data/chunk_names/aggV2_chunk_names.bed | cut -f 1-4,10-11`
+* Find and load the latest version of bcftools
+  * `module avail bcf`
+  * `module load <latest version full path>`
+* Run bcftools to find all participants with variants at that locus
+  * `bcftools query -r chr5:37064560 -i 'GT = "alt"' -f '[%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%GT\n]' /gel_data_resources/main_programme/aggregation/aggregate_gVCF_strelka/aggV2/genomic_data/gel_mainProgramme_aggV2_chr5_35164209_37978077.vcf.gz > 5_37064560_demo.txt`
+* View the results file
+  * `less -S 5_37064560_preview.txt`
+
+## Optional exercise
+
+To extend your learning, we have included an exercise here to practice building a rare disease cohort. Please make use of the code included in this notebook and modify where relevant.
+
+1. Use the LabKey API to look up participants with variants in the gene JPH3 that have been selected by rare disease tiering, cancer tiering or exomiser. Repeat your rare disease tiering query with NHS GMS data.
+2. Run the Small Variant and SV/CNV workflows to find participants with all variants in JPH3.
+3. Query the SomAgg aggregate VCF for all participants with an alternate allele at 16:87690170. Make sure you query the correct file chunk.
+
+### A possible solution
+
+```{r}
+# Import modules
+library(tidyverse)
+library(Rlabkey)
+
+# Cretae helper function
+labkey_to_df <- function(sql_query, database, maxrows){
+    # Retrieve LabKey table based on a user SQL query.
+    # 
+    # Arguments:
+    #       sql_query =   SQL query to ask the data base (character vector
+    #                     of size 1).
+    #       database  =   path containing the version of the programme
+    #                     release to investigate (e.g.: "/main-programme/
+    #                     main-programme_v14_2022-01-27")
+    #       maxrows   =   number of rows to ask from the database. This 
+    #                     parameter defaults to 100000000, but if the
+    #                     output contains exactly the default value, then
+    #                     we suggest increasing this value.
+    
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+
+# define database version
+version <- "main-programme/main-programme_v17_2023-03-30"
+
+# 1. Use the LabKey API to look up participants with 
+# variants in the gene JPH3 that have been selected by rare
+# disease tiering, cancer tiering or exomiser. Repeat your
+# rare disease tiering query with NHS GMS data.
+
+exercise_gene <- "JPH3"
+exercise_tiering_sql <- paste("SELECT participant_id, phenotype, assembly, chromosome, position, reference, alternate, genotype ",
+ "FROM tiering_data ",
+ "WHERE genomic_feature_hgnc='", exercise_gene, "'", sep="")
+exercise_tiering_query <- labkey_to_df(exercise_tiering_sql, version, 10000)
+exercise_tiering_query
+
+exercise_exomiser_gene_sql <- paste( "SELECT participant_id, phenotype, assembly, chromosome, position, hgvs, reference, alternate, genotype ",
+    "FROM exomiser ",
+    " WHERE genomic_feature_hgnc = '", exercise_gene, 
+    "'", sep="")
+
+exercise_exomiser_gene_query <- labkey_to_df(exercise_exomiser_gene_sql, version, 10000)
+exercise_exomiser_gene_query
+
+exercise_cancer_gene_tiering_sql = paste( "SELECT participant_id, disease_type, chr, pos, ref, alt
+    FROM cancer_tier_and_domain_variants
+    WHERE gene = '", exercise_gene, "'
+    ", sep = "")
+exercise_cancer_gene_tiering_query <- labkey_to_df(exercise_cancer_gene_tiering_sql, version, 10000)
+exercise_cancer_gene_tiering_query
+
+gms_version <- "nhs-gms/nhs-gms-release_v2_2023-02-28"
+
+exercise_gms_gene_tiering_sql <- paste("SELECT participant_id, phenotype, chromosome, position, reference, alternate, genotype
+    FROM tiering_data
+    WHERE genomic_feature_hgnc = '", exercise_gene, "'
+    ", sep = "")
+
+exercise_gms_gene_tiering_query <- labkey_to_df(exercise_gms_gene_tiering_sql, gms_version, 10000)
+exercise_gms_gene_tiering_query
+```
+
+2. Run the Small Variant and SV/CNV workflows to find participants with all variants in JPH3.
+
+Small variant:
+
+* `ssh` to the HPC with your usual login credentials
+* `cd` into your working directory
+* Make and cd into your working directory
+    * `mkdir small_variant_demo`
+    * `cd small_variant_demo`
+* Copy the Small Variant workflow submission script into your folder
+    * `/pgen_int_data_resources/workflows/rdp_small_variant/main/submit.sh .`
+* Make the file `gene_list.txt` and add your list of genes to it
+    * `vi exercise_gene_list.txt`
+    * Add `JPH3` to the file
+    * `Esc :wq`
+* Edit the submission script:
+   * `vi submit.sh`
+   * Change the `project_code` to your code
+   * Change the `gene_input` to `exercise_gene_list.txt`
+   *`Esc :wq`
+* Run the workflow
+    * `bsub < submit.sh`
+* Find your results when the job is finished
+
+SV/CNV:
+
+* `ssh` to the HPC with your usual login credentials
+* `cd` into your working directory
+* Copy the SV/CNV workflow and cd into your folder
+  * `cp -R /gel_data_resources/workflows/BRS_tools_svcnvWorkflow/v2.0.1/ svcnv_demo`
+  * `cd svcnv_demo`
+* Edit the file `input/gene_list.txt`
+  * `vi input/gene_list.txt`
+  * Add `JPH3` to the file
+  * `Esc :wq`
+* Edit the submission script:
+  * `vi submit_script.sh`
+  * Change the `project_code` to your code
+  * `Esc :wq`
+* Run the workflow
+  * `bsub < submit_script.sh`
+* Find your results when the job is finished
+
+3. Query the SomAgg aggregate VCF for all participants with an alternate allele at 16:87690170. Make sure you query the correct file chunk.
+
+* `ssh` to the HPC with your usual login credentials
+* `cd` into your working directory
+* Create a BED file of your variant locus
+   * `vi exercise_variant_region.bed`
+  * `chr16    87690170        87690170        variant`
+  * `Esc :wq`
+* Find and load the latest version of bedtools
+  * `module avail bedtools`
+  * `module load <latest version full path>`
+* Use bedtools to find the relevant chunk
+  * `bedtools intersect -wo -a exercise_variant_region.bed -b /gel_data_resources/main_programme/aggregation/aggregated_somatic_strelka/somAgg/v0.2/additional_data/chunk_names/somAgg_chunk_names.bed | cut -f 1-4,10-11`
+* Find and load the latest version of bcftools
+  * `module avail bcf`
+  * `module load <latest version full path>`
+* Run bcftools to find all participants with variants at that locus
+  * `bcftools query -r chr16:87690170 -i 'GT = "alt"' -f '[%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%GT\n]' /gel_data_resources/main_programme/aggregation/aggregated_somatic_strelka/somAgg/v0.2/genomic_data/somAgg_dr12_chr16_86237099_87967279.vcf.gz > 16_87690170_demo.txt`
+* View the results file
+  * `less -S 16_87690170_demo.txt`

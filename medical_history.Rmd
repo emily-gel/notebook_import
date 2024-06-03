@@ -31,7 +31,9 @@ This notebook will walk you through getting medical histories for participants u
 
 ```{r}
 library(tidyverse)
-library(Rlabkey)
+library(data.table)
+library(glue)
+library(RPostgres)
 ```
 
 ## Helper function to access the LabKey API with R
@@ -40,34 +42,30 @@ The following R function accesses the LabKey API, executes an SQL query to the s
 
 ```{r}
 labkey_to_df <- function(sql_query, database, maxrows){
-    # Retrieve LabKey table based on a user SQL query.
-    # 
-    # Arguments:
-    #       sql_query =   SQL query to ask the data base (character vector
-    #                     of size 1).
-    #       database  =   path containing the version of the programme
-    #                     release to investigate (e.g.: "/main-programme/
-    #                     main-programme_v14_2022-01-27")
-    #       maxrows   =   number of rows to ask from the database. This 
-    #                     parameter defaults to 100000000, but if the
-    #                     output contains exactly the default value, then
-    #                     we suggest increasing this value.
-    
-    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
-    
-    labkey.executeSql(folderPath = database,
-                      schemaName = "lists",
-                      colNameOpt = "rname",
-                      sql = sql_query,
-                      maxRows = maxrows) %>%
-        mutate(across(everything(), as.character))
-}
+  DBNAME = "gel_clinical_cb_sql_pro"
+  HOST = "clinical-cb-sql-pro.cfe5cdx3wlef.eu-west-2.rds.amazonaws.com"
+  PORT = 5432
+  PASSWORD = 'anXReTz36Q5r'
+  USER = 'jupyter_notebook'
+
+  connection <- DBI::dbConnect(
+      RPostgres::Postgres(),
+      dbname = DBNAME,
+      host = HOST,
+      port = PORT,
+      password = PASSWORD,
+      user = USER,
+      options = paste("-c search_path=", database, sep="")
+      )
+
+  dbGetQuery(connection, sql_query, n = maxrows)
+  }
 ```
 
 To run my queries, I'll need to set up my database version:
 
 ```{r}
-version <- "main-programme/main-programme_v17_2023-03-30"
+version <- "source_data_100kv16_covidv4"
 ```
 
 ## Get details from a single `hes_*` table for a participant
@@ -75,7 +73,7 @@ version <- "main-programme/main-programme_v17_2023-03-30"
 We're going to find all the diagnoses for an individual from the `hes_ae` table and the dates of those diagnoses. The participant we're looking at is 111000592.
 
 ```{r}
-part_id <- "111000592"
+part_id <- # add an ID here
 hes_sql <- paste("SELECT participant_id, arrivaldate, diag_all  
     FROM hes_ae
     WHERE participant_id = ", part_id, sep="")
@@ -493,7 +491,7 @@ mhsds_query
 
 To extend your learning, we have included an exercise here to practice looking up medical history for participants. Please make use of the code included in this notebook and modify where relevant.
 
-1. Using the LabKey API find all admissions in the hes_apc table for the participant ID 111000328. Get the dates of admission and discharge, all diagnoses and all operations.
+1. Using the LabKey API find all admissions in the hes_apc table for the participant ID ###### (see file inside RE for ID). Get the dates of admission and discharge, all diagnoses and all operations.
 2. Filter these apc admissions to only include those who came from A&E, check the admimeth column of hes_apc and the data dictionary to understand what the codes mean. Cross reference to the hes_ae table to find the original admission.
 3. Find details of all outpatients appointments that occurred in the 28 days following a diagnosis of epilepsy, G40.9. 
 
@@ -502,40 +500,38 @@ To extend your learning, we have included an exercise here to practice looking u
 ```{r}
 # Import modules
 library(tidyverse)
-library(Rlabkey)
+library(data.table)
+library(glue)
+library(RPostgres)
 
 # create helper function
-labkey_to_df <- function(sql_query, database, maxrows){
-    # Retrieve LabKey table based on a user SQL query.
-    # 
-    # Arguments:
-    #       sql_query =   SQL query to ask the data base (character vector
-    #                     of size 1).
-    #       database  =   path containing the version of the programme
-    #                     release to investigate (e.g.: "/main-programme/
-    #                     main-programme_v14_2022-01-27")
-    #       maxrows   =   number of rows to ask from the database. This 
-    #                     parameter defaults to 100000000, but if the
-    #                     output contains exactly the default value, then
-    #                     we suggest increasing this value.
-    
-    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
-    
-    labkey.executeSql(folderPath = database,
-                      schemaName = "lists",
-                      colNameOpt = "rname",
-                      sql = sql_query,
-                      maxRows = maxrows) %>%
-        mutate(across(everything(), as.character))
-}
 
+labkey_to_df <- function(sql_query, database, maxrows){
+  DBNAME = "gel_clinical_cb_sql_pro"
+  HOST = "clinical-cb-sql-pro.cfe5cdx3wlef.eu-west-2.rds.amazonaws.com"
+  PORT = 5432
+  PASSWORD = 'anXReTz36Q5r'
+  USER = 'jupyter_notebook'
+
+  connection <- DBI::dbConnect(
+      RPostgres::Postgres(),
+      dbname = DBNAME,
+      host = HOST,
+      port = PORT,
+      password = PASSWORD,
+      user = USER,
+      options = paste("-c search_path=", database, sep="")
+      )
+
+  dbGetQuery(connection, sql_query, n = maxrows)
+  }
 # define database version
-version <- "main-programme/main-programme_v17_2023-03-30"
+version <- "source_data_100kv16_covidv4"
 ```
 ```{r}
-# 1. Using the LabKey API find all admissions in the hes_apc table for the participant ID 111000328. Get the dates of admission and discharge, all diagnoses and all operations.
+# 1. Using the LabKey API find all admissions in the hes_apc table for the participant ID ########. Get the dates of admission and discharge, all diagnoses and all operations.
 
-exercise_part_id <- 111000328
+exercise_part_id <- # add ID here
 
 exercise_hes_sql <- paste("SELECT participant_id, admidate, disdate, diag_all, opertn_all 
     FROM hes_apc

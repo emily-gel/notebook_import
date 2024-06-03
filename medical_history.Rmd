@@ -1,0 +1,619 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Getting medical histories for participants
+
+This notebook will walk you through getting medical histories for participants using the LabKey API in R. You are welcome to copy/paste any code from this notebook for your own scripts/notebooks.
+
+## Contents:
+
+* Import R libraries you need
+* Helper function to access the LabKey API with R
+* Get details from a single `hes_*` table for a participant
+* Plot full medical history
+  * Find all diagnoses
+  * Find all investigations
+  * Find all treatments
+* Link events in medical history
+  * Match accident and emergency episodes to overnight admissions
+  * Find critical care periods within an overnight stay
+  * Find hospital day appointments before or after another type of admission
+  * Find details of diagnostic imaging within a time period
+  * ECDS
+* Mental health data
+* Optional exercise
+
+## Import R libraries you need
+
+```{r}
+library(tidyverse)
+library(Rlabkey)
+```
+
+## Helper function to access the LabKey API with R
+
+The following R function accesses the LabKey API, executes an SQL query to the specified database and returns it as a dataframe. We recommend putting this at the beginning of your scripts/notebooks and invoking it every time you want to access the database.
+
+```{r}
+labkey_to_df <- function(sql_query, database, maxrows){
+    # Retrieve LabKey table based on a user SQL query.
+    # 
+    # Arguments:
+    #       sql_query =   SQL query to ask the data base (character vector
+    #                     of size 1).
+    #       database  =   path containing the version of the programme
+    #                     release to investigate (e.g.: "/main-programme/
+    #                     main-programme_v14_2022-01-27")
+    #       maxrows   =   number of rows to ask from the database. This 
+    #                     parameter defaults to 100000000, but if the
+    #                     output contains exactly the default value, then
+    #                     we suggest increasing this value.
+    
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+```
+
+To run my queries, I'll need to set up my database version:
+
+```{r}
+version <- "main-programme/main-programme_v17_2023-03-30"
+```
+
+## Get details from a single `hes_*` table for a participant
+
+We're going to find all the diagnoses for an individual from the `hes_ae` table and the dates of those diagnoses. The participant we're looking at is 111000592.
+
+```{r}
+part_id <- "111000592"
+hes_sql <- paste("SELECT participant_id, arrivaldate, diag_all  
+    FROM hes_ae
+    WHERE participant_id = ", part_id, sep="")
+
+hes_query <- labkey_to_df(hes_sql, version, 1000)
+hes_query
+```
+The following code tidies up those diagnoses so that they're separated by commas and any empty fields are deleted:
+
+```{r}
+tidyup <- function(df){
+  df[] <- lapply(df, gsub, pattern='\\|{2,}', replacement='')
+  df[] <- lapply(df, gsub, pattern='\\|', replacement=', ')
+  data.frame(df)
+}
+hes_query <- tidyup(hes_query)
+hes_query
+```
+You can repeat a similar query with the other `hes_*` tables, pulling out other data. Please note that the dates in all the `hes_*` tables are named differently.
+
+## Plot full medical history
+
+The following code allows you to pull out all events from a participants medical history, and display them in a single plot.
+
+### Find all diagnoses
+
+First, we will pull out all diagnoses from the `hes_*` and `ecds` tables. Dates in all these tables are coded differently.
+
+```{r}
+part_id <- 111000592
+diag_table <- data.frame()
+
+ae_sql <- paste(
+    "SELECT participant_id, arrivaldate as date, diag_all 
+    FROM hes_ae
+    WHERE participant_id = ", part_id, sep="")
+ae_query <- labkey_to_df(ae_sql, version, 1000)
+if (nrow(ae_query) > 0) {
+  ae_query$table <- 'hes_ae - A&E diagnosis code'
+  diag_table <- rbind(diag_table, ae_query)
+}
+
+apc_sql <- paste(
+    "SELECT participant_id, admidate as date, diag_all 
+    FROM hes_apc
+    WHERE participant_id = ", part_id, sep="")
+apc_query <- labkey_to_df(apc_sql, version, 1000)
+if (nrow(apc_query) > 0) {
+  apc_query$table <- 'hes_apc - ICD10 code'
+  diag_table <- rbind(diag_table, apc_query)
+}
+
+op_sql <- paste(
+    "SELECT participant_id, apptdate as date, diag_all 
+    FROM hes_op
+    WHERE participant_id = ", part_id, sep="")
+op_query <- labkey_to_df(op_sql, version, 1000)
+if (nrow(op_query) > 0) {
+  op_query$table <- 'hes_op - ICD10 code'
+  diag_table <- rbind(diag_table, op_query)
+}
+
+ecds_sql <- paste(
+    "SELECT participant_id, seen_date as date, diagnosis_code_all as diag_all
+    FROM ecds
+    WHERE participant_id = ", part_id, sep="")
+ecds_query <- labkey_to_df(ecds_sql, version, 1000)
+if (nrow(ecds_query) > 0) {
+  ecds_query$table <- 'ecds - SNOMED CT'
+  diag_table <- rbind(diag_table, ecds_query)
+}
+
+diag_table
+```
+
+Instead of using our `tidyup` function, we want to split the table to have one diagnosis per row
+
+```{r}
+diag_table <- separate_longer_delim(diag_table, diag_all, delim ="|")
+diag_table$diag_all[diag_table$diag_all==""] <- NA
+diag_table <- diag_table[complete.cases(diag_table), ]
+diag_table$date <- as.Date(diag_table$date)
+diag_table
+```
+
+Now we can plot all diagnoses over time.
+
+```{r}
+library(ggplot2)
+ggplot(data = diag_table, aes(x = date, y = diag_all, colour = table)) +
+  geom_point() +
+  labs(x = "Date of diagnosis",
+    y = "Codes",
+    title = "Diagnoses over time")
+```
+
+
+## Find all investigations
+
+Now we will do the same with investigations.
+
+```{r}
+invest_table <- data.frame()
+
+ae_invest_sql <- paste(
+    "SELECT participant_id, arrivaldate as date,invest_all 
+    FROM hes_ae
+    WHERE participant_id = ", part_id, sep="")
+ae_invest_query <- labkey_to_df(ae_invest_sql, version, 1000)
+if (nrow(ae_invest_query) > 0) {
+  ae_invest_query$table <- 'hes_ae - A&E investigation code'
+  invest_table <- rbind(invest_table, ae_invest_query)
+}
+
+did_invest_sql <- paste(
+    "SELECT participant_id, did_date3 as date, did_snomedct_code invest_all 
+    FROM did
+    WHERE participant_id = ", part_id, sep="")
+did_invest_query <- labkey_to_df(did_invest_sql, version, 1000)
+if (nrow(did_invest_query) > 0) {
+  did_invest_query$table <- 'did _SNOMED CT code'
+  invest_table <- rbind(invest_table, did_invest_query)
+}
+
+ecds_invest_sql <- paste(
+    "SELECT participant_id, seen_date as date, investigation_code_all as invest_all
+    FROM ecds
+    WHERE participant_id = ", part_id, sep="")
+ecds_invest_query <- labkey_to_df(ecds_invest_sql, version, 1000)
+if (nrow(ecds_invest_query) > 0) {
+  ecds_invest_query$table <- 'ecds - SNOMED CT'
+  invest_table <- rbind(invest_table, ecds_invest_query)
+}
+
+invest_table
+```
+
+We will split our table by investigations.
+
+```{r}
+invest_table <- separate_longer_delim(invest_table, invest_all, delim ="|")
+invest_table$invest_all[invest_table$invest_all==""] <- NA
+invest_table <- invest_table[complete.cases(invest_table), ]
+invest_table$date <- as.Date(invest_table$date)
+invest_table
+```
+
+Now we can plot all investigations over time.
+
+```{r}
+library(ggplot2)
+ggplot(data = invest_table, aes(x = date, y = invest_all, colour = table)) +
+  geom_point() +
+  labs(x = "Date of investigation",
+    y = "Codes",
+    title = "Investigations over time")
+```
+
+## Find all treatments
+
+```{r}
+treat_table <- data.frame()
+
+ae_treat_sql <- paste(
+    "SELECT participant_id, arrivaldate as date, treat_all 
+    FROM hes_ae
+    WHERE participant_id = ", part_id, sep="")
+ae_treat_query <- labkey_to_df(ae_treat_sql, version, 1000)
+if (nrow(ae_treat_query) > 0) {
+  ae_treat_query$table <- 'hes_ae - A&E treatment code'
+  treat_table <- rbind(treat_table, ae_treat_query)
+}
+
+apc_treat_sql <- paste(
+    "SELECT participant_id, admidate as date, opertn_all as treat_all 
+    FROM hes_apc
+    WHERE participant_id = ", part_id, sep="")
+apc_treat_query <- labkey_to_df(apc_treat_sql, version, 1000)
+if (nrow(apc_treat_query) > 0) {
+  apc_treat_query$table <- 'hes_apc - OPCS4'
+  treat_table <- rbind(treat_table, apc_treat_query)
+}
+
+op_treat_sql <- paste(
+    "SELECT participant_id, apptdate as date, opertn_all as treat_all
+    FROM hes_op
+    WHERE participant_id = ", part_id, sep="")
+op_treat_query <- labkey_to_df(op_treat_sql, version, 1000)
+if (nrow(op_treat_query) > 0) {
+  op_treat_query$table <- 'hes_op - OPCS4'
+  treat_table <- rbind(treat_table, op_treat_query)
+}
+
+ecds_treat_sql <- paste(
+    "SELECT participant_id, seen_date as date, treatment_code_all as treat_all
+    FROM ecds
+    WHERE participant_id = ", part_id, sep="")
+ecds_treat_query <- labkey_to_df(ecds_treat_sql, version, 1000)
+if (nrow(ecds_treat_query) > 0) {
+  ecds_treat_query$table <- 'ecds - SNOMED CT'
+  treat_table <- rbind(treat_table, ecds_treat_query)
+}
+
+treat_table
+```
+
+
+```{r}
+treat_table <- separate_longer_delim(treat_table, treat_all, delim ="|")
+treat_table$treat_all[treat_table$treat_all==""] <- NA
+treat_table <- treat_table[complete.cases(treat_table), ]
+treat_table$date <- as.Date(treat_table$date)
+treat_table
+```
+
+Now we can plot all diagnoses over time.
+
+```{r}
+library(ggplot2)
+ggplot(data = treat_table, aes(x = date, y = treat_all, colour = table)) +
+  geom_point() +
+  labs(x = "Date of treatment",
+    y = "Codes",
+    title = "Treatment over time")
+```
+
+## Link events in medical history
+
+### Match accident and emergency episodes to overnight admissions
+
+We're now going to combine this with a query of the `hes_apc` table. The following query finds all episodes where the participants went to accident and emergency, then were admitted for an overnight stay. It does this by checking for the `epikey` in both the `hes_ae` and `hes_apc` tables. We will find all the diagnoses and operations the participant received in both A&E and after admission.
+
+```{r}
+ae_apc_sql <- paste("SELECT ae.participant_id, 
+  ae.arrivaldate as ae_arrival, 
+  ae.diag_all as ae_diag, 
+  apc.admidate as apc_arrival, 
+  apc.disdate as apc_discharge, 
+  apc.opertn_all as apc_operation, 
+  apc.diag_all as apc_diag
+    FROM hes_ae as ae, hes_apc as apc
+    WHERE ae.epikey = apc.epikey
+    AND ae.participant_id = ", part_id, sep = "")
+
+ae_apc_query <- labkey_to_df(ae_apc_sql, version, 1000)
+ae_apc_query <- tidyup(ae_apc_query)
+ae_apc_query
+```
+
+
+### Find critical care periods within an overnight stay
+
+This next query extends this further by checking the `hes_cc` table for all time spent in critical care while in admitted patient care. We can link the `hes_cc` table episodes to the `hes_apc` episodes using the `susrecid` column.
+
+```{r}
+ae_apc_cc_sql <- paste("SELECT ae.participant_id, 
+  ae.arrivaldate as ae_arrival, 
+  ae.diag_all as ae_diag, 
+  apc.admidate as apc_arrival, 
+  apc.disdate as apc_discharge, 
+  apc.opertn_all as apc_operation, 
+  apc.diag_all as apc_diag,
+  cc.ccstartdate as cc_start,
+  cc.ccdisdate as cc_discharge
+    FROM hes_ae as ae
+    FULL OUTER JOIN hes_apc as apc ON ae.epikey = apc.epikey 
+    FULL OUTER JOIN hes_cc as cc ON apc.susrecid = cc.susrecid
+    WHERE ae.participant_id = ", part_id,
+  "ORDER BY ae.arrivaldate, apc.admidate", sep = "")
+
+ae_apc_cc_query <- labkey_to_df(ae_apc_cc_sql, version, 1000)
+ae_apc_cc_query <- tidyup(ae_apc_cc_query)
+ae_apc_cc_query
+```
+
+### Find hospital day appointments before or after another type of admission
+
+Now we're selecting a single row of the above table (in this case an arbitrary selection, but you may wish to select a row based on a diagnosis) and finding the discharge date. We will then find all outpatients appointments (day appointments at the hospital) that occurred in the 90 days after discharge. You could also search for appointment before a particular admission or procedure, or between certain events.
+
+```{r}
+date <- tail(ae_apc_cc_query$apc_discharge, n=1)
+date_plus <- as.Date(date) + 90
+
+op_sql <- paste("SELECT participant_id, 
+  apptdate, tretspef, mainspef, diag_all, opertn_all
+  FROM hes_op
+  WHERE participant_id = ", part_id,
+  " AND apptdate > '", date,
+  "' AND apptdate < '", date_plus,
+  "' ORDER BY apptdate", sep = "")
+
+op_query <- labkey_to_df(op_sql, version, 1000)
+op_query <- tidyup(op_query)
+op_query
+```
+You may also wish to use `rttperstart` and `rttperend` to find the start and end of a series of appointments, but be aware that these columns are often blank and you will miss appointments by this method.
+
+### Find details of diagnostic imaging within a time period
+
+To find details of any diagnostic imaging, we will use the `did` table. There is no key that links entries in the `did` table to any of the `hes_*` tables, so we will use dates to link these.
+
+In this query, we will use our query from above to filter out all admissions with a particular diagnosis (in this case R06, abnormalities of breathing) and find all did rows where the imaging date `did_date3` falls within the hospital stay.
+
+```{r}
+diag <- 'R06'
+
+episodes <- ae_apc_cc_query %>% filter(grepl(diag, apc_diag))
+row_counter <- 1
+did_combined <- data.frame()
+
+for(i in 1:nrow(episodes)) {
+  episodes$did_index[i] <- row_counter
+  did_sql <- paste("SELECT participant_id, 
+    did_date3, ic_region_desc, ic_snomedct_desc, ic_sub_sys_desc, ic_nicip_desc
+    FROM did
+    WHERE participant_id = ", part_id, 
+    " AND did_date3 >= '", episodes[i, "ae_arrival"],
+    "' AND did_date3 <= '", episodes[i, "apc_discharge"],
+    "'", sep = "")
+  
+  did_query <- labkey_to_df(did_sql, version, 1000)
+  did_query$did_index <- row_counter
+  did_combined <- rbind(did_combined, did_query)
+  row_counter <- row_counter + 1
+}
+
+episodes <- merge(episodes, did_combined, by = c("did_index", "participant_id"))
+episodes
+```
+
+###  ECDS
+
+The ECDS table has different column headings, so we have to alter our queries accordingly. The following query gets all the diagnoses, treatments and investigations for a participant, with the date of arrival.
+
+```{r}
+ecds_sql <- paste("SELECT participant_id, seen_date, diagnosis_code_all, investigation_code_all, treatment_code_all ", 
+    "FROM ecds ",
+    "WHERE participant_id = ", part_id, sep="")
+
+ecds_query <- labkey_to_df(ecds_sql, version, 1000)
+
+ecds_query <- tidyup(ecds_query)
+ecds_query
+```
+## Mental health data
+
+Now we're going to look at the mental health tables. There are three sets of tables that cover different time periods:
+
+* **mhmd** (Mental Health Minimum Dataset) – 2011-2014
+* **mhldds** (Mental Health Learning Disabilities Dataset) – 2014-2016
+* **mhsds** (Mental Health Services Dataset) – 2016 onwards
+
+We're going to query these tables for information about the participant 111000207. `mhmd` and `mhldds` both follow similar schema, with `record`, `event` and `episode` tables, where a `record` is a superset of `episodes` which is a superset of `events`, linked by a `spell_id`. We'll start by querying the `mhmd` tables to find all details for our participant of interest.
+
+```{r}
+mh_part <- 111000207
+
+mhmd_sql <- paste("SELECT r.participant_id, r.mhd_mhmds_spell_id,
+    ep.mhd_epitype, ep.mhd_epistart_date, ep.mhd_epiend_date,
+    ev.mhd_eventtype, ev.mhd_eventdate
+    FROM mhmd_v4_record as r
+    LEFT JOIN mhmd_v4_episode as ep
+        ON r.mhd_mhmds_spell_id = ep.mhd_mhmds_spell_id
+    LEFT JOIN mhmd_v4_event as ev
+        ON r.mhd_mhmds_spell_id = ev.mhd_mhmds_spell_id
+    WHERE r.participant_id = ", mh_part, 
+    sep = "")
+
+mhmd_query <- labkey_to_df(mhmd_sql, version, 300000)
+mhmd_query
+```
+
+We can use a very similar query with `mhldds`, as most of the columns are the same. You may find you need to change the column selections for certain data types.
+
+```{r}
+mhldds_sql <- paste("SELECT r.participant_id, r.mhd_mhmds_spell_id,
+    ep.mhd_epitype, ep.mhd_epistart_date, ep.mhd_epiend_date,
+    ev.mhd_eventtype, ev.mhd_eventdate
+    FROM mhldds_record as r
+    LEFT JOIN mhldds_episode as ep
+        ON r.mhd_mhmds_spell_id = ep.mhd_mhmds_spell_id
+    LEFT JOIN mhldds_event as ev
+        ON r.mhd_mhmds_spell_id = ev.mhd_mhmds_spell_id
+    WHERE r.participant_id = ", mh_part, 
+    sep = "")
+
+mhldds_query <- labkey_to_df(mhldds_sql, version, 50000)
+mhldds_query
+```
+
+To query the more recent `mhsds` records we have to use a completely different method. We will query the curated tables, which are tied together by the `recordnumber`.
+
+```{r}
+mhsds_sql <- paste("SELECT p.participant_id, p.recordnumber,
+    p.startdategmpregistration, p.enddategmpregistration,
+    i.startdatewardstay, i.enddatewardstay, i.treatfunccodemh,
+    c.refertotreatperiodstartdate, c.refertotreatperiodenddate,
+    a.startdatecareclust, a.enddatecareclust
+    FROM mhsds_curated_participant as p
+    FULL OUTER JOIN mhsds_curated_inpatient as i
+        ON p.recordnumber = i.recordnumber
+    FULL OUTER JOIN mhsds_curated_community as c
+        ON p.recordnumber = c.recordnumber
+    FULL OUTER JOIN  mhsds_curated_assessment_diagnoses_and_cluster as a
+        ON p.recordnumber = a.recordnumber
+    WHERE p.participant_id = ", mh_part,
+    sep = "")
+
+mhsds_query <- labkey_to_df(mhsds_sql, version, 100)
+mhsds_query
+```
+
+
+## Optional exercise
+
+To extend your learning, we have included an exercise here to practice looking up medical history for participants. Please make use of the code included in this notebook and modify where relevant.
+
+1. Using the LabKey API find all admissions in the hes_apc table for the participant ID 111000328. Get the dates of admission and discharge, all diagnoses and all operations.
+2. Filter these apc admissions to only include those who came from A&E, check the admimeth column of hes_apc and the data dictionary to understand what the codes mean. Cross reference to the hes_ae table to find the original admission.
+3. Find details of all outpatients appointments that occurred in the 28 days following a diagnosis of epilepsy, G40.9. 
+
+### A possible solution
+
+```{r}
+# Import modules
+library(tidyverse)
+library(Rlabkey)
+
+# create helper function
+labkey_to_df <- function(sql_query, database, maxrows){
+    # Retrieve LabKey table based on a user SQL query.
+    # 
+    # Arguments:
+    #       sql_query =   SQL query to ask the data base (character vector
+    #                     of size 1).
+    #       database  =   path containing the version of the programme
+    #                     release to investigate (e.g.: "/main-programme/
+    #                     main-programme_v14_2022-01-27")
+    #       maxrows   =   number of rows to ask from the database. This 
+    #                     parameter defaults to 100000000, but if the
+    #                     output contains exactly the default value, then
+    #                     we suggest increasing this value.
+    
+    labkey.setDefaults(baseUrl = "https://labkey-embassy.gel.zone/labkey/")
+    
+    labkey.executeSql(folderPath = database,
+                      schemaName = "lists",
+                      colNameOpt = "rname",
+                      sql = sql_query,
+                      maxRows = maxrows) %>%
+        mutate(across(everything(), as.character))
+}
+
+# define database version
+version <- "main-programme/main-programme_v17_2023-03-30"
+```
+```{r}
+# 1. Using the LabKey API find all admissions in the hes_apc table for the participant ID 111000328. Get the dates of admission and discharge, all diagnoses and all operations.
+
+exercise_part_id <- 111000328
+
+exercise_hes_sql <- paste("SELECT participant_id, admidate, disdate, diag_all, opertn_all 
+    FROM hes_apc
+    WHERE participant_id = ", exercise_part_id, sep="")
+
+exercise_hes_query <- labkey_to_df(exercise_hes_sql, version, 1000)
+
+tidyup <- function(df){
+  df[] <- lapply(df, gsub, pattern='\\|{2,}', replacement='')
+  df[] <- lapply(df, gsub, pattern='\\|', replacement=', ')
+  data.frame(df)
+}
+exercise_hes_query <- tidyup(exercise_hes_query)
+exercise_hes_query
+```
+
+```{r}
+# 2. Filter these apc admissions to only include those who came from A&E, check the admimeth column of hes_apc and the data dictionary to understand what the codes mean. Cross reference to the hes_ae table to find the original admission.
+
+admimeth <- 21
+
+exercise_ae_apc_sql <- paste(
+    "SELECT apc.participant_id, 
+        apc.admidate as apc_admission, 
+        apc.disdate as apc_discharge, 
+        apc.diag_all as apc_diag, 
+        apc.opertn_all as apc_opertn,
+        ae.arrivaldate as ae_arrival, 
+        ae.diag_all as ae_diag
+    FROM hes_apc as apc
+    FULL OUTER JOIN hes_ae as ae
+        ON apc.epikey = ae.epikey
+    WHERE apc.participant_id = '", exercise_part_id, "'
+    AND apc.admimeth = '", admimeth, "'",
+    sep = "")
+
+exercise_ae_apc_query <- labkey_to_df(exercise_ae_apc_sql, version, 1000)
+exercise_ae_apc_query <- tidyup(exercise_ae_apc_query)
+exercise_ae_apc_query
+```
+```{r}
+# 3. Find details of all outpatients appointments that occurred in the 28 days following a diagnosis of epilepsy, G40.9.
+
+epilepsy <- 'G409'
+
+epilepsy_episodes <- exercise_ae_apc_query %>% filter(grepl(epilepsy, apc_diag))
+exercise_row_counter <- 1
+exercise_op_combined <- data.frame()
+
+for(i in 1:nrow(epilepsy_episodes)) {
+  epilepsy_episodes$op_index[i] <- exercise_row_counter
+  ep_date <- epilepsy_episodes[i, "apc_discharge"]
+  ep_date_plus <- as.Date(ep_date) + 28
+  
+  ep_op_sql <- paste("SELECT participant_id, 
+        apptdate, tretspef, mainspef, diag_all, opertn_all
+        FROM hes_op
+        WHERE participant_id = ", exercise_part_id, 
+    " AND apptdate > '", ep_date,
+    "' AND apptdate <= '", ep_date_plus,
+    "'", sep = "")
+  
+  ep_op_query <- labkey_to_df(ep_op_sql, version, 1000)
+  if (nrow(ep_op_query) > 0){
+    ep_op_query$op_index <- exercise_row_counter
+    exercise_op_combined <- rbind(exercise_op_combined, ep_op_query)
+  }
+  exercise_row_counter <- exercise_row_counter + 1
+}
+
+exercise_episodes <- tidyup(merge(epilepsy_episodes, exercise_op_combined, by = c("op_index", "participant_id")))
+exercise_episodes
+
+```
+
+
+
+
+
+
+
